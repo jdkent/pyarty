@@ -105,8 +105,10 @@ class BundleField:
     kind: FieldKind
     annotation: Any
     dataclass_field: DataclassField[Any]
-    metadata: Tuple[BundleMetadata, ...] = ()
-    raw_metadata: Mapping[str, Any] = MappingProxyType({})
+    metadata: Tuple[BundleMetadata, ...] = dataclass_field(default_factory=tuple)
+    raw_metadata: Mapping[str, Any] = dataclass_field(
+        default_factory=lambda: MappingProxyType({})
+    )
     is_collection: bool = False
 
 

@@ -14,6 +14,7 @@ from .dsl import (
     bundle,
     twig,
 )
+from .reader import InferredBundle, infer_bundle_from_directory
 from .writer import RenderError, write_bundle
 
 __all__ = [
@@ -31,4 +32,6 @@ __all__ = [
     "HintKind",
     "RenderError",
     "write_bundle",
+    "InferredBundle",
+    "infer_bundle_from_directory",
 ]

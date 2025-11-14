@@ -126,3 +126,19 @@ Missing sources emit a warning and fall back to writing the literal string paylo
 - **Batteries-included**: `.write(path)` takes care of directories, files, and serialization.
 
 Define once, render anywhere. Life's a pyarty.
+
+## Infer From Existing Trees
+
+Need to reverse-engineer a directory into bundle dataclasses? Use
+`infer_bundle_from_directory` to read `.txt`, `.json`, and `.jsonl` files, generate
+CamelCase bundle classes, and emit a JSON Schema description. The returned
+instance already has `.write` so you can clone the tree elsewhere.
+
+```python
+from pyarty import infer_bundle_from_directory
+
+inferred = infer_bundle_from_directory("./artifact-drop", root_class_name="ArtifactBundle")
+print(inferred.schema["$ref"])          # JSON Schema for documentation
+clone = inferred.instance
+clone.write("./artifact-copy")          # round-trip to a new location
+```
