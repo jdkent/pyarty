@@ -40,7 +40,7 @@ from pyarty import Dir
 
 @bundle
 class Experiment:
-    reports: Dir[list[Report]] = twig(name="{name}", source="field")
+    reports: Dir[list[Report]] = twig(name=("{name}", "field"))
     summary: File[dict]
 
 experiment = Experiment(
@@ -65,8 +65,9 @@ experiments/
 ## Advanced Naming
 
 ```python
-def custom_dir_name(field_name, field, self, index):
-    return f"{self.label}-{index}-{field.slug}"
+def custom_dir_name(node, index=None):
+    suffix = f"-{index}" if index is not None else ""
+    return f"{node.slug}{suffix}"
 
 @bundle
 class Node:
@@ -76,7 +77,10 @@ class Node:
 @bundle
 class Tree:
     label: str
-    nodes: Dir[list[Node]] = twig(name=custom_dir_name)
+    nodes: Dir[list[Node]] = twig(
+        prefix=("{label}", "self"),
+        name=(custom_dir_name, "field"),
+    )
 
 tree = Tree(label="demo", nodes=[Node(slug="n1", payload="X"), Node(slug="n2", payload="Y")])
 ```
@@ -84,10 +88,11 @@ tree = Tree(label="demo", nodes=[Node(slug="n1", payload="X"), Node(slug="n2", p
 Filesystem:
 ```
 ./tree/
-├── tree-0-n1/
-│   └── payload.txt
-└── tree-1-n2/
-    └── payload.txt
+└── demo/
+    ├── n1-0/
+    │   └── payload.txt
+    └── n2-1/
+        └── payload.txt
 ```
 
 ## File-Type Awareness

@@ -1,25 +1,13 @@
 from typing import Dict, List, Union
 
-from pyarty import (
-    Dir,
-    FieldKind,
-    File,
-    NameCallable,
-    NameTemplate,
-    NameLiteral,
-    bundle,
-    twig,
-)
+from pyarty import Dir, FieldKind, File, HintKind, bundle, twig
 
 
 def test_bundle():
 
-    def _generate_file_name(
-        field_name: str, _value, _owner, extension: str, indexer=None
-    ) -> str:
-        if indexer is None:
-            indexer = "00"
-        return f"{field_name}_{indexer}.{extension}"
+    def _generate_file_name(owner, index=None) -> str:
+        suffix = index if index is not None else "00"
+        return f"{owner.slug}_{suffix}"
 
     @bundle
     class FileInDir:
@@ -70,23 +58,24 @@ def test_bundle():
     my_file_metadata = my_file_field.metadata[0]
     assert my_file_metadata.layer is File
     callable_hint = my_file_metadata.data["name"]
-    assert isinstance(callable_hint, NameCallable)
-    assert callable_hint.func is _generate_file_name
+    assert callable_hint.kind is HintKind.CALLABLE
+    assert callable_hint.value is _generate_file_name
 
     slug_file_field = next(
         field for field in bundle_definition.fields if field.name == "slug_file"
     )
     slug_file_metadata = slug_file_field.metadata[0]
     name_hint = slug_file_metadata.data["name"]
-    assert isinstance(name_hint, NameTemplate)
-    assert name_hint.template == "{slug}"
+    assert name_hint.kind is HintKind.TEMPLATE
+    assert name_hint.value == "{slug}"
+    assert name_hint.source == "self"
 
     static_file_field = next(
         field for field in bundle_definition.fields if field.name == "static_file"
     )
     static_file_metadata = static_file_field.metadata[0]
     static_name_hint = static_file_metadata.data["name"]
-    assert isinstance(static_name_hint, NameLiteral)
+    assert static_name_hint.kind is HintKind.LITERAL
     assert static_name_hint.value == "static"
 
     ## expected directory structure:
@@ -163,7 +152,7 @@ def test_article_corpus_structure():
     class ArticleCorpus:
         label: str
         articles: Dir[List[ArticleBundle]] = twig(
-            name=lambda field_name, article_bundle, corpus, index: f"{corpus.label}_{index}"
+            name=(lambda corpus, index: f"{corpus.label}_{index}", "self")
         )
 
     article_specs = [
@@ -265,8 +254,8 @@ def test_article_corpus_structure():
     table_def = SingleTable.__bundle_definition__
     assert table_def.fields[0].kind == FieldKind.VALUE
     table_name_meta = table_def.fields[1].metadata[0].data["name"]
-    assert isinstance(table_name_meta, NameTemplate)
-    assert table_name_meta.template == "{name}"
+    assert table_name_meta.kind is HintKind.TEMPLATE
+    assert table_name_meta.value == "{name}"
     assert table_name_meta.source == "self"
 
     corpus_def = ArticleCorpus.__bundle_definition__
@@ -275,7 +264,7 @@ def test_article_corpus_structure():
     )
     assert articles_field.kind == FieldKind.DIR
     articles_name_hint = articles_field.metadata[0].data["name"]
-    assert isinstance(articles_name_hint, NameCallable)
+    assert articles_name_hint.kind is HintKind.CALLABLE
 
 
 def test_field_based_template_naming():
@@ -287,16 +276,16 @@ def test_field_based_template_naming():
 
     @bundle
     class ReportSet:
-        reports: Dir[List[Report]] = twig(name="{name}", source="field")
+        reports: Dir[List[Report]] = twig(name=("{name}", "field"))
 
     report_def = ReportSet.__bundle_definition__
     reports_field = next(
         field for field in report_def.fields if field.name == "reports"
     )
     name_hint = reports_field.metadata[0].data["name"]
-    assert isinstance(name_hint, NameTemplate)
+    assert name_hint.kind is HintKind.TEMPLATE
     assert name_hint.source == "field"
-    assert name_hint.template == "{name}"
+    assert name_hint.value == "{name}"
 
 
 def test_extension_inference_variants():
@@ -325,8 +314,9 @@ def test_extension_inference_variants():
 
 def test_callable_name_with_varargs():
 
-    def variant_name(field_name, field_value, owner, *extras):
-        return f"{owner.prefix}-{field_name}"
+    def variant_name(owner, index=None, *extras):
+        suffix = index if index is not None else "x"
+        return f"{owner.prefix}-{suffix}"
 
     @bundle
     class Variant:
@@ -338,5 +328,5 @@ def test_callable_name_with_varargs():
         field for field in definition.fields if field.name == "payload"
     )
     hint = payload_field.metadata[0].data["name"]
-    assert isinstance(hint, NameCallable)
-    assert hint.func is variant_name
+    assert hint.kind is HintKind.CALLABLE
+    assert hint.value is variant_name

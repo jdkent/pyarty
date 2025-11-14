@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Type
+from typing import Any, Callable, Iterable, Mapping, Type
 
 from .dsl import (
     BundleDefinition,
@@ -12,10 +12,8 @@ from .dsl import (
     FieldKind,
     File,
     Dir,
-    NameCallable,
-    NameField,
-    NameTemplate,
-    NameLiteral,
+    Hint,
+    HintKind,
 )
 
 
@@ -116,31 +114,46 @@ def _compute_name(
 ) -> str:
     layer = Dir if field.kind is FieldKind.DIR else File
     metadata = _metadata_for_layer(field.metadata, layer)
-    hint = metadata.get("name")
-    if isinstance(hint, NameTemplate):
-        context = {}
-        source_obj = owner if hint.source == "self" else subject
-        context.update(_context_from(source_obj))
+    name_hint = metadata.get("name")
+    name = _resolve_hint(name_hint, owner, subject, index, field.name)
+    if name is None:
+        if field.kind is FieldKind.DIR and field.is_collection and index is not None:
+            name = field.name
+        else:
+            name = _default_name(field.name, index)
+    prefix_hint = metadata.get("prefix")
+    if prefix_hint:
+        prefix_value = _resolve_hint(prefix_hint, owner, subject, index, field.name)
+        if prefix_value:
+            return _apply_prefix(prefix_value, name)
+    return name
+
+
+def _resolve_hint(
+    hint: Hint | None,
+    owner: Any,
+    subject: Any,
+    index: int | None,
+    field_name: str,
+) -> str | None:
+    if hint is None:
+        return None
+    context = owner if hint.source == "self" else subject
+    if hint.kind is HintKind.LITERAL:
+        return str(hint.value)
+    if hint.kind is HintKind.TEMPLATE:
+        context_mapping = dict(_context_from(context))
         if index is not None:
-            context.setdefault("index", index)
+            context_mapping.setdefault("index", index)
         try:
-            return hint.template.format(**context)
+            return hint.value.format(**context_mapping)
         except KeyError as exc:
             raise RenderError(
-                f"Missing template variable {exc.args[0]!r} for field '{field.name}'."
+                f"Missing template variable {exc.args[0]!r} for field '{field_name}'."
             ) from exc
-    if isinstance(hint, NameField):
-        try:
-            return str(getattr(owner, hint.field))
-        except AttributeError as exc:
-            raise RenderError(
-                f"Field '{field.name}' references missing attribute '{hint.field}'."
-            ) from exc
-    if isinstance(hint, NameLiteral):
-        return hint.value
-    if isinstance(hint, NameCallable):
-        return _invoke_name_callable(hint.func, field.name, subject, owner, index)
-    return _default_name(field.name, index)
+    if hint.kind is HintKind.CALLABLE:
+        return _invoke_hint_callable(hint.value, context, index)
+    raise RenderError(f"Unsupported hint kind for field '{field_name}'.")
 
 
 def _context_from(source: Any) -> Mapping[str, Any]:
@@ -159,22 +172,19 @@ def _default_name(field_name: str, index: int | None) -> str:
     return f"{field_name}_{index}"
 
 
-def _invoke_name_callable(
-    func: Callable[..., Any],
-    field_name: str,
-    field_value: Any,
-    owner: Any,
-    index: int | None,
+def _apply_prefix(prefix: str, name: str) -> str:
+    return str(Path(prefix) / name)
+
+
+def _invoke_hint_callable(
+    func: Callable[..., Any], context: Any, index: int | None
 ) -> str:
-    args = [field_name, field_value, owner]
-    if index is not None:
-        args.append(index)
     try:
         sig = inspect.signature(func)
     except (TypeError, ValueError):
-        return str(func(*args))
+        return str(func(context) if index is None else func(context, index))
 
-    positional = [
+    params = [
         p
         for p in sig.parameters.values()
         if p.kind
@@ -183,10 +193,14 @@ def _invoke_name_callable(
     has_varargs = any(
         p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
     )
-    if not positional and not has_varargs:
-        raise RenderError("Name callable must accept positional arguments.")
-    arg_list = args if has_varargs else args[: len(positional)]
-    return str(func(*arg_list))
+    args: list[Any] = []
+    if not params and not has_varargs:
+        return str(func())
+    if params:
+        args.append(context)
+    if index is not None and (has_varargs or len(args) < len(params)):
+        args.append(index)
+    return str(func(*args))
 
 
 def _write_payload(target: Path, payload: Any, extension: str | None) -> None:

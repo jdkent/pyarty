@@ -35,8 +35,8 @@ constraints:
   functional:
     - "`@bundle` decorator converts dataclasses, records field metadata, and attaches a `.write()` helper."
     - "`Dir[T]` and `File[T]` annotations validated to ensure directories reference other bundles and files do not contain nested directories."
-    - "`twig()` helper captures optional `name`, `source`, and `extension` metadata for fields."
-    - "`NameTemplate`, `NameField`, and `NameCallable` metadata drive directory and file naming."
+    - "`twig()` helper captures optional `name`, `prefix`, and `extension` metadata for fields."
+    - "Naming hints (literal, template, callable) drive directory and file naming."
     - "Default file extensions inferred from type annotations (text, mappings, JSONL lists, etc.)."
     - "Bundle instances store per-instance metadata via the `metadata` init keyword."
     - "`write_bundle` renders bundle instances, creating directories for `Dir[...]` fields and serializing files (text, bytes, JSON, JSONL)."
@@ -76,7 +76,7 @@ domain:
     - "`BundleDefinition`: captures bundle class structure."
     - "`BundleField`: enriched dataclass field metadata."
     - "`BundleMetadata`: normalized metadata per field/layer."
-    - "`NameTemplate`, `NameField`, `NameCallable`: naming helpers."
+    - "Naming hints (`HintKind` literal/template/callable)."
   relationships:
     - "BundleDefinition → sequence of BundleField entries."
     - "BundleField metadata drives naming and serialization during writing."
@@ -93,7 +93,7 @@ domain:
       BundleMetadata = {
         "layer": Dir | File,
         "index": 0,
-        "data": {"name": NameTemplate | NameField | NameCallable, "extension": "json"}
+        "data": {"name": Hint, "extension": "json"}
       }
     - >
       Python DSL example:
@@ -115,9 +115,8 @@ interfaces:
     - "`BundleField`"
     - "`BundleMetadata`"
     - "`FieldKind`"
-    - "`NameTemplate`"
-    - "`NameField`"
-    - "`NameCallable`"
+    - "`Hint`"
+    - "`HintKind`"
     - "`write_bundle`"
     - "`RenderError`"
   cli: []

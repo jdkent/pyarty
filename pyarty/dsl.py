@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import collections.abc as abc
-import inspect
 from dataclasses import Field as DataclassField
 from dataclasses import dataclass, field as dataclass_field, fields, is_dataclass
 from enum import Enum
@@ -45,10 +44,8 @@ __all__ = [
     "BundleField",
     "BundleDefinition",
     "FieldKind",
-    "NameTemplate",
-    "NameField",
-    "NameCallable",
-    "NameLiteral",
+    "Hint",
+    "HintKind",
 ]
 
 
@@ -83,6 +80,14 @@ class FieldKind(str, Enum):
     VALUE = "value"
 
 
+class HintKind(str, Enum):
+    """Classification for naming/prefix hints."""
+
+    LITERAL = "literal"
+    TEMPLATE = "template"
+    CALLABLE = "callable"
+
+
 @dataclass(frozen=True)
 class BundleMetadata:
     """Normalized metadata targeting a specific DSL layer."""
@@ -102,6 +107,16 @@ class BundleField:
     dataclass_field: DataclassField[Any]
     metadata: Tuple[BundleMetadata, ...] = ()
     raw_metadata: Mapping[str, Any] = MappingProxyType({})
+    is_collection: bool = False
+
+
+@dataclass(frozen=True)
+class Hint:
+    """Normalized runtime naming hint."""
+
+    kind: HintKind
+    value: Any
+    source: str
 
 
 @dataclass(frozen=True)
@@ -125,6 +140,8 @@ BundleClass = TypeVar("BundleClass", bound=type)
 INSTANCE_METADATA_ATTR = "__bundle_instance_metadata__"
 INIT_WRAPPED_ATTR = "__bundle_init_wrapped__"
 RUNTIME_METADATA_KWARG = "__bundle_metadata__"
+_HINT_SOURCES = ("self", "field")
+_DEFAULT_HINT_SOURCE = "self"
 
 
 def bundle(
@@ -158,24 +175,24 @@ def bundle(
 
 def twig(
     *,
-    name: str | None = None,
-    source: str | None = None,
+    name: Any | None = None,
     extension: str | None = None,
+    prefix: Any | None = None,
     **field_kwargs: Any,
 ) -> DataclassField[Any]:
     """Helper for declaring bundle-aware dataclass fields.
 
-    Wraps :func:`dataclasses.field`, merging ``name``/``source`` hints with any provided metadata.
+    Wraps :func:`dataclasses.field`, merging naming and extension hints with any provided metadata.
     Works for both :class:`Dir` and :class:`File` annotations.
     """
 
     metadata: Dict[str, Any] = {}
     if name is not None:
         metadata["name"] = name
-    if source is not None:
-        metadata["source"] = source
     if extension is not None:
         metadata["extension"] = _normalize_extension_value(extension)
+    if prefix is not None:
+        metadata["prefix"] = prefix
     return dataclass_field(metadata=metadata if metadata else None, **field_kwargs)
 
 
@@ -216,6 +233,9 @@ def _build_bundle_definition(cls: Type[Any]) -> BundleDefinition:
             if kind in (FieldKind.DIR, FieldKind.FILE)
             else ()
         )
+        is_collection = (
+            kind is FieldKind.DIR and _dir_annotation_is_collection(annotation)
+        )
         collected.append(
             BundleField(
                 name=dc_field.name,
@@ -224,10 +244,10 @@ def _build_bundle_definition(cls: Type[Any]) -> BundleDefinition:
                 dataclass_field=dc_field,
                 metadata=normalized_metadata,
                 raw_metadata=raw_metadata,
+                is_collection=is_collection,
             )
         )
     definition = BundleDefinition(cls=cls, fields=tuple(collected))
-    _validate_name_targets(definition)
     return definition
 
 
@@ -258,69 +278,6 @@ def _extract_runtime_metadata(kwargs: MutableMapping[str, Any]) -> Any:
     if RUNTIME_METADATA_KWARG in kwargs:
         return kwargs.pop(RUNTIME_METADATA_KWARG)
     return None
-
-
-def _validate_name_targets(definition: BundleDefinition) -> None:
-    field_map = {bundle_field.name: bundle_field for bundle_field in definition.fields}
-    for bundle_field in definition.fields:
-        if bundle_field.kind not in (FieldKind.DIR, FieldKind.FILE):
-            continue
-        for meta in bundle_field.metadata:
-            if "name" not in meta.data:
-                continue
-            target = meta.data["name"]
-            if isinstance(target, (NameTemplate, NameLiteral)):
-                continue
-            if isinstance(target, NameField):
-                referenced = field_map.get(target.field)
-                if referenced is None:
-                    raise BundleMetadataError(
-                        f"Field '{bundle_field.name}' in '{definition.cls.__name__}' references unknown "
-                        f"name source '{target.field}'."
-                    )
-                if referenced.kind != FieldKind.VALUE:
-                    raise BundleMetadataError(
-                        f"Field '{bundle_field.name}' in '{definition.cls.__name__}' must reference a "
-                        "value field for dynamic naming."
-                    )
-                continue
-            if isinstance(target, NameCallable):
-                _validate_name_callable(target.func, definition, bundle_field)
-                continue
-            raise BundleMetadataError(
-                f"Metadata 'name' for field '{bundle_field.name}' in '{definition.cls.__name__}' must be "
-                "either a callable, template, or value-field name."
-            )
-
-
-def _validate_name_callable(
-    fn: Callable[..., Any], definition: BundleDefinition, bundle_field: BundleField
-) -> None:
-    if not _callable_accepts(fn, min_required=2):
-        raise BundleMetadataError(
-            f"Callable 'name' metadata for field '{bundle_field.name}' in '{definition.cls.__name__}' must "
-            "accept at least two positional arguments (field_name, field_value)."
-        )
-
-
-def _callable_accepts(fn: Callable[..., Any], min_required: int) -> bool:
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return True
-    params = list(sig.parameters.values())
-    positional = [
-        p
-        for p in params
-        if p.kind
-        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
-    if has_varargs:
-        return True
-    available = len(positional)
-    required = len([p for p in positional if p.default is inspect._empty])
-    return available >= min_required and required >= min_required
 
 
 def _strip_annotated(annotation: Any) -> Any:
@@ -413,6 +370,17 @@ def _extract_dir_payload(argument: Any) -> Type[Any] | None:
     return None
 
 
+def _dir_annotation_is_collection(annotation: Any) -> bool:
+    args = get_args(_strip_annotated(annotation))
+    if len(args) != 1:
+        return False
+    candidate = _strip_annotated(args[0])
+    origin = get_origin(candidate)
+    if origin in _DIR_COLLECTION_ORIGINS:
+        return True
+    return False
+
+
 def _normalize_metadata(
     annotation: Any,
     metadata: Mapping[str, Any],
@@ -482,79 +450,70 @@ def _top_layer(annotation: Any) -> Type[Any]:
     raise InvalidBundleAnnotation("Top-level annotation must be Dir or File")
 
 
-class NameTemplate:
-    """Represents a format string applied to either the current field owner or the field value."""
-
-    __slots__ = ("template", "source")
-
-    def __init__(self, template: str, source: str = "self") -> None:
-        if source not in ("self", "field"):
-            raise BundleMetadataError(
-                f"Name template source must be 'self' or 'field'; got '{source}'."
-            )
-        self.template = template
-        self.source = source
-
-
-@dataclass(frozen=True)
-class NameField:
-    """Reference to another value field for naming."""
-
-    field: str
-
-
-@dataclass(frozen=True)
-class NameLiteral:
-    """Represents an explicit literal name."""
-
-    value: str
-
-
-@dataclass(frozen=True)
-class NameCallable:
-    """Callable-based naming hook."""
-
-    func: Callable[..., Any]
-
-
 def _normalize_metadata_layer(
     layer: Type[Any], data: Mapping[str, Any]
 ) -> Mapping[str, Any]:
     normalized: Dict[str, Any] = {}
-    source = data.get("source")
     for key, value in data.items():
-        if key == "source":
-            continue
         if key == "name":
-            hint = _normalize_name_hint(value, source)
+            hint = _normalize_hint_entry("name", value)
             if hint is not None:
                 normalized["name"] = hint
             continue
         if key == "extension":
             normalized["extension"] = _normalize_extension_value(value)
             continue
+        if key == "prefix":
+            hint = _normalize_hint_entry("prefix", value)
+            if hint is not None:
+                normalized["prefix"] = hint
+            continue
         normalized[key] = value
     return MappingProxyType(normalized)
 
 
-def _normalize_name_hint(
-    value: Any, source: str | None
-) -> NameTemplate | NameField | NameCallable | NameLiteral | None:
+def _normalize_hint_entry(entry_name: str, value: Any) -> Hint | None:
     if value is None:
         return None
-    if isinstance(value, (NameTemplate, NameField, NameCallable, NameLiteral)):
-        return value
-    if isinstance(value, str):
-        if "{" in value:
-            return NameTemplate(value, source or "self")
-        if source:
+    hint_value = value
+    hint_source = _DEFAULT_HINT_SOURCE
+    if isinstance(value, tuple):
+        if len(value) != 2:
             raise BundleMetadataError(
-                "Metadata key 'source' is only valid alongside template-based names."
+                f"Metadata entry '{entry_name}' must be a value/source tuple."
             )
-        return NameLiteral(value)
-    if callable(value):
-        return NameCallable(value)
-    raise BundleMetadataError("Unsupported value for 'name' metadata entry.")
+        hint_value, hint_source = value
+    if isinstance(hint_source, str):
+        normalized_source = hint_source.strip().lower()
+    else:
+        normalized_source = ""
+    if normalized_source not in _HINT_SOURCES:
+        raise BundleMetadataError(
+            f"Metadata entry '{entry_name}' source must be one of {_HINT_SOURCES}; got {hint_source!r}."
+        )
+    hint_source = normalized_source
+    if isinstance(hint_value, Hint):
+        if hint_value.source not in _HINT_SOURCES:
+            raise BundleMetadataError(
+                f"Hint source must be one of {_HINT_SOURCES}; got {hint_value.source!r}."
+            )
+        return hint_value
+    if callable(hint_value):
+        return Hint(HintKind.CALLABLE, hint_value, hint_source)
+    if isinstance(hint_value, str):
+        if not hint_value:
+            raise BundleMetadataError(
+                f"Metadata entry '{entry_name}' cannot be an empty string."
+            )
+        kind = (
+            HintKind.TEMPLATE
+            if ("{" in hint_value and "}" in hint_value)
+            else HintKind.LITERAL
+        )
+        return Hint(kind, hint_value, hint_source)
+    raise BundleMetadataError(
+        f"Unsupported value for '{entry_name}' metadata entry."
+    )
 
 
 def _maybe_attach_extension(

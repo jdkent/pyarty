@@ -16,7 +16,7 @@ class WriterReport:
 @bundle
 class WriterReportSet:
     label: str
-    reports: Dir[List[WriterReport]] = twig(name="{name}", source="field")
+    reports: Dir[List[WriterReport]] = twig(name=("{name}", "field"))
     summary: File[dict]
 
 
@@ -42,8 +42,9 @@ def test_render_simple_bundle(tmp_path):
     assert summary["reports"] == 2
 
 
-def _custom_node_name(field_name, child, owner, index):
-    return f"{owner.label}-{index}-{child.slug}"
+def _custom_node_name(node, index=None):
+    suffix = f"-{index}" if index is not None else ""
+    return f"{node.slug}{suffix}"
 
 
 @bundle
@@ -55,7 +56,7 @@ class WriterNode:
 @bundle
 class WriterTree:
     label: str
-    nodes: Dir[List[WriterNode]] = twig(name=_custom_node_name)
+    nodes: Dir[List[WriterNode]] = twig(name=(_custom_node_name, "field"))
 
 
 def test_callable_directory_names(tmp_path):
@@ -66,4 +67,55 @@ def test_callable_directory_names(tmp_path):
 
     out_dir = tmp_path / "tree"
     bundle_instance.write(out_dir)
-    assert (out_dir / "tree-0-n1" / "payload.txt").read_text() == "x"
+    assert (out_dir / "n1-0" / "payload.txt").read_text() == "x"
+
+
+@bundle
+class ListDirChild:
+    payload: File[str]
+
+
+@bundle
+class ListDirRoot:
+    processed: Dir[List[ListDirChild]]
+
+
+def test_dir_list_defaults_to_field_name(tmp_path):
+    bundle_instance = ListDirRoot(processed=[ListDirChild(payload="hello")])
+    out_dir = tmp_path / "article"
+    bundle_instance.write(out_dir)
+    assert (out_dir / "processed" / "payload.txt").read_text() == "hello"
+
+
+@bundle
+class PrefixedDirChild:
+    slug: str
+    payload: File[str]
+
+
+@bundle
+class PrefixedDirRoot:
+    nodes: Dir[List[PrefixedDirChild]] = twig(
+        prefix="processed", name=("{slug}", "field")
+    )
+
+
+def test_dir_prefix_applied(tmp_path):
+    bundle_instance = PrefixedDirRoot(
+        nodes=[PrefixedDirChild(slug="n1", payload="x")]
+    )
+    out_dir = tmp_path / "prefixed"
+    bundle_instance.write(out_dir)
+    assert (out_dir / "processed" / "n1" / "payload.txt").read_text() == "x"
+
+
+@bundle
+class PrefixedFileRoot:
+    report: File[str] = twig(prefix="reports", name="summary")
+
+
+def test_file_prefix_applied(tmp_path):
+    bundle_instance = PrefixedFileRoot(report="hello world")
+    out_dir = tmp_path / "file-prefix"
+    bundle_instance.write(out_dir)
+    assert (out_dir / "reports" / "summary.txt").read_text() == "hello world"
