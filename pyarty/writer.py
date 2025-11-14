@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import inspect
 import json
+import shutil
+import warnings
+from os import PathLike
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Type
 
@@ -78,14 +81,24 @@ def _render_file_field(
 ) -> None:
     metadata = _metadata_for_layer(field.metadata, layer_type=File)
     extension = metadata.get("extension")
+    explicit_extension = "extension" in field.raw_metadata
+    copyfile_flag = bool(metadata.get("copyfile"))
     name = _compute_name(field, owner, value, None)
     if not name:
         raise RenderError(f"File field '{field.name}' produced an empty name.")
     filename = name
+    source_path: Path | None = None
+    if copyfile_flag:
+        source_path = _pathlike_or_none(value)
+        inferred_ext = _infer_extension_from_source(source_path)
+        if inferred_ext and not explicit_extension:
+            extension = inferred_ext
     if extension:
         filename = f"{filename}.{extension}"
     target = base_path / filename
     target.parent.mkdir(parents=True, exist_ok=True)
+    if copyfile_flag and _copy_file_payload(source_path, target):
+        return
     _write_payload(target, value, extension)
 
 
@@ -230,3 +243,51 @@ def _write_payload(target: Path, payload: Any, extension: str | None) -> None:
     raise RenderError(
         f"Unsupported payload type for field output: {type(payload).__name__}."
     )
+
+
+def _copy_file_payload(source_path: Path | None, target: Path) -> bool:
+    if source_path is None:
+        warnings.warn(
+            "copyfile metadata requires a string or path-like payload; falling back to default serialization.",
+            RuntimeWarning,
+        )
+        return False
+    if not source_path.exists():
+        warnings.warn(
+            f"copyfile source '{source_path}' does not exist; falling back to default serialization.",
+            RuntimeWarning,
+        )
+        return False
+    if source_path.is_dir():
+        warnings.warn(
+            f"copyfile source '{source_path}' is a directory; falling back to default serialization.",
+            RuntimeWarning,
+        )
+        return False
+    try:
+        shutil.copy2(source_path, target)
+    except OSError as exc:
+        warnings.warn(
+            f"copyfile unable to copy '{source_path}' -> '{target}': {exc}; falling back to default serialization.",
+            RuntimeWarning,
+        )
+        return False
+    return True
+
+
+def _pathlike_or_none(value: Any) -> Path | None:
+    if isinstance(value, Path):
+        return value
+    if isinstance(value, (str, PathLike)):
+        return Path(value)
+    return None
+
+
+def _infer_extension_from_source(source_path: Path | None) -> str | None:
+    if source_path is None:
+        return None
+    suffix = source_path.suffix
+    if not suffix:
+        return None
+    normalized = suffix.lstrip(".")
+    return normalized or None

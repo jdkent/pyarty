@@ -178,6 +178,7 @@ def twig(
     name: Any | None = None,
     extension: str | None = None,
     prefix: Any | None = None,
+    copyfile: bool | None = None,
     **field_kwargs: Any,
 ) -> DataclassField[Any]:
     """Helper for declaring bundle-aware dataclass fields.
@@ -193,6 +194,8 @@ def twig(
         metadata["extension"] = _normalize_extension_value(extension)
     if prefix is not None:
         metadata["prefix"] = prefix
+    if copyfile is not None:
+        metadata["copyfile"] = bool(copyfile)
     return dataclass_field(metadata=metadata if metadata else None, **field_kwargs)
 
 
@@ -467,6 +470,9 @@ def _normalize_metadata_layer(
             hint = _normalize_hint_entry("prefix", value)
             if hint is not None:
                 normalized["prefix"] = hint
+            continue
+        if key == "copyfile":
+            normalized["copyfile"] = bool(value)
             continue
         normalized[key] = value
     return MappingProxyType(normalized)

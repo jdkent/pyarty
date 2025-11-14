@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import List
+
+import pytest
 
 from pyarty import Dir, File, bundle, twig
 
@@ -119,3 +122,39 @@ def test_file_prefix_applied(tmp_path):
     out_dir = tmp_path / "file-prefix"
     bundle_instance.write(out_dir)
     assert (out_dir / "reports" / "summary.txt").read_text() == "hello world"
+
+
+@bundle
+class CopyFileBundle:
+    asset: File[str] = twig(copyfile=True)
+
+
+def test_copyfile_from_string(tmp_path):
+    source = tmp_path / "source.bin"
+    source.write_text("binary-ish")
+    bundle_instance = CopyFileBundle(asset=str(source))
+    out_dir = tmp_path / "copy-string"
+    bundle_instance.write(out_dir)
+    target = out_dir / "asset.bin"
+    assert target.read_text() == "binary-ish"
+    assert source.read_text() == "binary-ish"
+
+
+def test_copyfile_from_path(tmp_path):
+    source = tmp_path / "data.raw"
+    source.write_bytes(b"\x00\x01\x02")
+    bundle_instance = CopyFileBundle(asset=source)
+    out_dir = tmp_path / "copy-path"
+    bundle_instance.write(out_dir)
+    target = out_dir / "asset.raw"
+    assert target.read_bytes() == b"\x00\x01\x02"
+
+
+def test_copyfile_missing_warns_and_falls_back(tmp_path):
+    missing = tmp_path / "missing.txt"
+    bundle_instance = CopyFileBundle(asset=str(missing))
+    out_dir = tmp_path / "copy-missing"
+    with pytest.warns(RuntimeWarning):
+        bundle_instance.write(out_dir)
+    target = out_dir / "asset.txt"
+    assert target.read_text() == str(missing)

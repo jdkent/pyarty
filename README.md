@@ -103,6 +103,21 @@ Filesystem:
 
 Custom extensions are a `twig(extension="bin")` away.
 
+## Copy Existing Files
+
+Need to keep an artifact generated elsewhere? Declare `twig(copyfile=True)` and pass a path-like value. If you omit `extension=...`, the copied file keeps its original suffix.
+
+```python
+@bundle
+class Artifact:
+    path: File[str] = twig(copyfile=True)
+
+artifact = Artifact(path="/tmp/model.bin")
+artifact.write("./release")
+# copies /tmp/model.bin to release/path.bin
+```
+Missing sources emit a warning and fall back to writing the literal string payload.
+
 ## Why pyarty?
 
 - **Schema-first**: clear bundle definitions, YAML/JSON friendly.
