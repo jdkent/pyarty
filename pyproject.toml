@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyarty"
+version = "0.0.0"
+description = "Declarative filesystem bundle schemas"
+readme = "README.md"
+authors = [{name = "pyarty contributors"}]
+requires-python = ">=3.11"
+keywords = ["filesystem", "schema", "dsl"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://example.com/pyarty"

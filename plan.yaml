@@ -1,0 +1,182 @@
+meta:
+  project_name: "pyarty"
+  description: >
+    Dataclass-driven DSL for describing filesystem bundles and a writer that
+    materializes bundle instances to disk using metadata-aware naming and
+    lightweight serialization.
+  iteration: "v0.1-dsl-writer"
+  updated: "2025-11-14"
+
+purpose:
+  problem: >
+    Pipeline outputs, experiment bundles, and structured result directories are
+    typically built with ad-hoc code. There is no standard for describing these
+    layouts, validating them, or reconstructing them from Python objects. This
+    library provides a declarative, schema-first approach that supports humans
+    and AI agents authoring bundle specifications.
+  goals:
+    - "Provide a Python DSL for declaring filesystem bundles with Dir[T] and File[T] markers."
+    - "Normalize metadata for bundle fields, including naming templates, runtime references, and extensions."
+    - "Infer sensible default file extensions from type annotations."
+    - "Render bundle instances to disk with predictable naming and basic serialization support."
+    - "Keep the base installation dependency-free."
+  non_goals:
+    - "No built-in workflow execution, DAGs, or pipeline scheduling."
+    - "No automatic schema inference or validation in the current release."
+    - "No persistence of runtime data beyond writing to disk."
+    - "No automatic regeneration of Python dataclasses from serialized specs."
+  users:
+    - "Data engineers writing pipeline output bundles."
+    - "Researchers generating reproducible analysis output trees."
+    - "Library authors defining reusable fixture or test directory layouts."
+    - "AI agents generating or modifying structured output schemas."
+
+constraints:
+  functional:
+    - "`@bundle` decorator converts dataclasses, records field metadata, and attaches a `.write()` helper."
+    - "`Dir[T]` and `File[T]` annotations validated to ensure directories reference other bundles and files do not contain nested directories."
+    - "`twig()` helper captures optional `name`, `source`, and `extension` metadata for fields."
+    - "`NameTemplate`, `NameField`, and `NameCallable` metadata drive directory and file naming."
+    - "Default file extensions inferred from type annotations (text, mappings, JSONL lists, etc.)."
+    - "Bundle instances store per-instance metadata via the `metadata` init keyword."
+    - "`write_bundle` renders bundle instances, creating directories for `Dir[...]` fields and serializing files (text, bytes, JSON, JSONL)."
+  non_functional:
+    - "Python 3.11+, type-hint heavy, dataclass-first design."
+    - "No non-stdlib dependencies in base package."
+    - "Deterministic field ordering based on dataclass definition order."
+  assumptions:
+    - "Most users serialize JSON/YAML or bytes; custom serializers optional."
+    - "Bundle schemas are authored in Python via dataclasses."
+  risks:
+    - "Metadata naming callables may be mis-specified leading to runtime errors."
+    - "Extension inference may not match user expectations for complex types."
+    - "Users may expect validation/inference capabilities that are not yet shipped."
+
+mvp:
+  must_have:
+    - "`Dir` and `File` marker types plus the `@bundle` decorator."
+    - "`BundleDefinition`, `BundleField`, `BundleMetadata`, and `FieldKind` for introspection."
+    - "Metadata normalization via `twig()` with support for naming hints and extensions."
+    - "Extension inference from type annotations."
+    - "`write_bundle` function and injected `.write()` method for rendering bundles to disk."
+    - "Serialization support for str, bytes, JSON, and JSONL payloads."
+  nice_to_have:
+    - "Validation of directory structures before writing."
+    - "Pluggable serializer registry for additional formats."
+    - "Runtime metadata hooks that influence naming or serialization."
+  future:
+    - "Schema inference from existing directory trees."
+    - "CLI for infer/validate/render workflows."
+    - "FSSPEC backends (S3/GCS) and plugin serializers (Parquet/CSV/figures)."
+    - "Schema visualizations / HTML reports."
+
+domain:
+  entities:
+    - "`Dir[T]` and `File[T]`: marker types applied to dataclass fields."
+    - "`BundleDefinition`: captures bundle class structure."
+    - "`BundleField`: enriched dataclass field metadata."
+    - "`BundleMetadata`: normalized metadata per field/layer."
+    - "`NameTemplate`, `NameField`, `NameCallable`: naming helpers."
+  relationships:
+    - "BundleDefinition → sequence of BundleField entries."
+    - "BundleField metadata drives naming and serialization during writing."
+    - "Dir fields reference other bundle-decorated classes or iterables thereof."
+  data_shapes:
+    - >
+      BundleField = {
+        "name": "details",
+        "kind": "file" | "dir" | "value",
+        "annotation": typing information,
+        "metadata": [BundleMetadata, ...]
+      }
+    - >
+      BundleMetadata = {
+        "layer": Dir | File,
+        "index": 0,
+        "data": {"name": NameTemplate | NameField | NameCallable, "extension": "json"}
+      }
+    - >
+      Python DSL example:
+        @bundle
+        class Report:
+            name: str
+            body: File[str] = twig(name="{name}")
+            details: File[dict]
+        report = Report(name="alpha", body="hello", details={"score": 10})
+        report.write("out/alpha")
+
+interfaces:
+  public_api:
+    - "`Dir`"
+    - "`File`"
+    - "`bundle` decorator"
+    - "`twig` helper"
+    - "`BundleDefinition`"
+    - "`BundleField`"
+    - "`BundleMetadata`"
+    - "`FieldKind`"
+    - "`NameTemplate`"
+    - "`NameField`"
+    - "`NameCallable`"
+    - "`write_bundle`"
+    - "`RenderError`"
+  cli: []
+  behavior_flows:
+    - "Author dataclass with `Dir`/`File` annotations → decorate with `@bundle` → instantiate bundle."
+    - "Call instance `.write(path)` (or `write_bundle(instance, path)`) → writer walks bundle definition → creates directories/files with metadata-aware names."
+  errors:
+    - "BundleError"
+    - "InvalidBundleAnnotation"
+    - "BundleMetadataError"
+    - "RenderError (naming, overwrite, or serialization issues)"
+
+architecture:
+  style: "modular, schema-first, plugin-extensible serializers"
+  components:
+    - "dsl: Dir[T], File[T], @bundle, twig, metadata normalization"
+    - "writer: write_bundle, naming, payload serialization"
+    - "package facade: pyarty/__init__.py"
+    - "tests: pytest coverage for DSL metadata and writer behavior"
+  flow:
+    - "User defines bundle class → instantiate → call `.write()` to materialize output."
+
+technology:
+  language: "Python 3.11+"
+  libraries:
+    - "Standard library only"
+  storage:
+    - "Local filesystem (MVP)"
+  deployment_target: "Local, CI, Docker environments"
+
+security:
+  sensitive_data:
+    - "None inherent—depends on user-provided data."
+  auth: "None; filesystem only."
+  privacy_notes: "Users responsible for not writing sensitive data."
+
+development:
+  testing:
+    - "Unit tests for DSL annotation/metadata handling."
+    - "Writer integration tests using pytest tmp_path fixtures."
+  folder_structure:
+    - "pyarty/dsl.py"
+    - "pyarty/writer.py"
+    - "pyarty/__init__.py"
+    - "tests/"
+  conventions:
+    - "PEP8, type hints, dataclasses."
+    - "Predictable ordering of children in specs."
+    - "Pathlib everywhere."
+    - "use pytest"
+
+operations:
+  logging:
+    - "Currently none (no logging hooks)."
+  metrics:
+    - "files_written (future)"
+    - "naming_overrides (future)"
+  deployment: "PyPI + GitHub Actions"
+  runbook_notes:
+    - "Author Python bundles, instantiate with runtime values, call `.write(path)` to emit outputs."
+    - "Use pytest to validate bundle behavior during development."
+    - "Add inference/validation steps once those modules land."
