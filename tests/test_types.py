@@ -47,7 +47,7 @@ def test_bundle():
         my_file=42,
         another_dir=EmbeddedDir(embedded_dir=EmbeddedFile(number=3.14)),
         slug_file="slug file",
-        metadata={"my_file": {"indexer": "fortytwo"}},
+        __bundle_metadata__={"my_file": {"indexer": "fortytwo"}},
     )
 
     assert (
@@ -86,6 +86,25 @@ def test_bundle():
     # └── another_dir/
     #     └── embedded_dir/
     #        └── number.bin
+
+
+def test_bundle_allows_metadata_field_and_runtime_metadata_kwarg():
+
+    @bundle
+    class Report:
+        name: str
+        body: File[str]
+        metadata: File[dict]
+
+    report = Report(
+        name="alpha",
+        body="payload",
+        metadata={"score": 10},
+        __bundle_metadata__={"runtime": True},
+    )
+
+    assert report.metadata == {"score": 10}
+    assert report.__bundle_instance_metadata__["runtime"] is True
 
 
 def test_article_corpus_structure():

@@ -123,6 +123,7 @@ BundleClass = TypeVar("BundleClass", bound=type)
 
 INSTANCE_METADATA_ATTR = "__bundle_instance_metadata__"
 INIT_WRAPPED_ATTR = "__bundle_init_wrapped__"
+RUNTIME_METADATA_KWARG = "__bundle_metadata__"
 
 
 def bundle(
@@ -236,7 +237,7 @@ def _ensure_instance_metadata_storage(cls: Type[Any]) -> None:
 
     @wraps(original_init)
     def __bundle_init__(self, *args, **kwargs):  # type: ignore[override]
-        runtime_metadata = kwargs.pop("metadata", None)
+        runtime_metadata = _extract_runtime_metadata(kwargs)
         _set_instance_metadata(self, runtime_metadata)
         original_init(self, *args, **kwargs)
 
@@ -250,6 +251,12 @@ def _set_instance_metadata(instance: Any, metadata: Any) -> None:
         setattr(instance, INSTANCE_METADATA_ATTR, payload)
     except AttributeError:
         object.__setattr__(instance, INSTANCE_METADATA_ATTR, payload)
+
+
+def _extract_runtime_metadata(kwargs: MutableMapping[str, Any]) -> Any:
+    if RUNTIME_METADATA_KWARG in kwargs:
+        return kwargs.pop(RUNTIME_METADATA_KWARG)
+    return None
 
 
 def _validate_name_targets(definition: BundleDefinition) -> None:

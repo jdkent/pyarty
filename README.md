@@ -40,7 +40,7 @@ from pyarty import Dir
 
 @bundle
 class Experiment:
-    reports: Dir[list[Report]] = twig(name="{name}")
+    reports: Dir[list[Report]] = twig(name="{name}", source="field")
     summary: File[dict]
 
 experiment = Experiment(
@@ -65,8 +65,8 @@ experiments/
 ## Advanced Naming
 
 ```python
-def custom_dir_name(field_name, child, owner, index):
-    return f"{owner.label}-{index}-{child.slug}"
+def custom_dir_name(field_name, field, self, index):
+    return f"{self.label}-{index}-{field.slug}"
 
 @bundle
 class Node:
