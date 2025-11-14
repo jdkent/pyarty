@@ -5,8 +5,8 @@ from pyarty import (
     FieldKind,
     File,
     NameCallable,
-    NameField,
     NameTemplate,
+    NameLiteral,
     bundle,
     twig,
 )
@@ -39,7 +39,8 @@ def test_bundle():
         my_dir: Dir[FileInDir]
         my_file: File[int] = twig(extension=".bin", name=_generate_file_name)
         another_dir: Dir[EmbeddedDir]
-        slug_file: File[str] = twig(name="slug")
+        slug_file: File[str] = twig(name="{slug}")
+        static_file: File[str] = twig(name="static")
 
     bundle_instance = MyBundle(
         slug="bundle-001",
@@ -47,6 +48,7 @@ def test_bundle():
         my_file=42,
         another_dir=EmbeddedDir(embedded_dir=EmbeddedFile(number=3.14)),
         slug_file="slug file",
+        static_file="static payload",
         __bundle_metadata__={"my_file": {"indexer": "fortytwo"}},
     )
 
@@ -60,6 +62,7 @@ def test_bundle():
         "my_file",
         "another_dir",
         "slug_file",
+        "static_file",
     ]
     my_file_field = next(
         field for field in bundle_definition.fields if field.name == "my_file"
@@ -75,8 +78,16 @@ def test_bundle():
     )
     slug_file_metadata = slug_file_field.metadata[0]
     name_hint = slug_file_metadata.data["name"]
-    assert isinstance(name_hint, NameField)
-    assert name_hint.field == "slug"
+    assert isinstance(name_hint, NameTemplate)
+    assert name_hint.template == "{slug}"
+
+    static_file_field = next(
+        field for field in bundle_definition.fields if field.name == "static_file"
+    )
+    static_file_metadata = static_file_field.metadata[0]
+    static_name_hint = static_file_metadata.data["name"]
+    assert isinstance(static_name_hint, NameLiteral)
+    assert static_name_hint.value == "static"
 
     ## expected directory structure:
     # my_bundle/

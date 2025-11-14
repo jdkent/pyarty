@@ -48,6 +48,7 @@ __all__ = [
     "NameTemplate",
     "NameField",
     "NameCallable",
+    "NameLiteral",
 ]
 
 
@@ -268,7 +269,7 @@ def _validate_name_targets(definition: BundleDefinition) -> None:
             if "name" not in meta.data:
                 continue
             target = meta.data["name"]
-            if isinstance(target, NameTemplate):
+            if isinstance(target, (NameTemplate, NameLiteral)):
                 continue
             if isinstance(target, NameField):
                 referenced = field_map.get(target.field)
@@ -503,6 +504,13 @@ class NameField:
 
 
 @dataclass(frozen=True)
+class NameLiteral:
+    """Represents an explicit literal name."""
+
+    value: str
+
+
+@dataclass(frozen=True)
 class NameCallable:
     """Callable-based naming hook."""
 
@@ -531,10 +539,10 @@ def _normalize_metadata_layer(
 
 def _normalize_name_hint(
     value: Any, source: str | None
-) -> NameTemplate | NameField | NameCallable | None:
+) -> NameTemplate | NameField | NameCallable | NameLiteral | None:
     if value is None:
         return None
-    if isinstance(value, (NameTemplate, NameField, NameCallable)):
+    if isinstance(value, (NameTemplate, NameField, NameCallable, NameLiteral)):
         return value
     if isinstance(value, str):
         if "{" in value:
@@ -543,7 +551,7 @@ def _normalize_name_hint(
             raise BundleMetadataError(
                 "Metadata key 'source' is only valid alongside template-based names."
             )
-        return NameField(value)
+        return NameLiteral(value)
     if callable(value):
         return NameCallable(value)
     raise BundleMetadataError("Unsupported value for 'name' metadata entry.")

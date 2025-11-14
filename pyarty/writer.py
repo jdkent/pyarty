@@ -15,6 +15,7 @@ from .dsl import (
     NameCallable,
     NameField,
     NameTemplate,
+    NameLiteral,
 )
 
 
@@ -135,6 +136,8 @@ def _compute_name(
             raise RenderError(
                 f"Field '{field.name}' references missing attribute '{hint.field}'."
             ) from exc
+    if isinstance(hint, NameLiteral):
+        return hint.value
     if isinstance(hint, NameCallable):
         return _invoke_name_callable(hint.func, field.name, subject, owner, index)
     return _default_name(field.name, index)

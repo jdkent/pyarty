@@ -10,6 +10,7 @@ from .dsl import (
     NameCallable,
     NameField,
     NameTemplate,
+    NameLiteral,
     Dir,
     File,
     bundle,
@@ -31,6 +32,7 @@ __all__ = [
     "NameField",
     "NameCallable",
     "NameTemplate",
+    "NameLiteral",
     "RenderError",
     "write_bundle",
 ]
