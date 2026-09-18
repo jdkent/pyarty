@@ -4,19 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyarty"
-version = "0.0.0"
-description = "Declarative filesystem bundle schemas"
+version = "0.1.0"
+description = "A two-way contract between directory trees and Python dataclasses"
 readme = "README.md"
 authors = [{name = "pyarty contributors"}]
 requires-python = ">=3.11"
-keywords = ["filesystem", "schema", "dsl"]
+keywords = ["filesystem", "schema", "dataclass", "serialization", "round-trip"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+    "Topic :: System :: Filesystems",
+    "Typing :: Typed",
 ]
 dependencies = []
 
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
 [project.urls]
-Homepage = "https://example.com/pyarty"
+Homepage = "https://github.com/jdkent/pyarty"
+Source = "https://github.com/jdkent/pyarty"
+
+[tool.setuptools.packages.find]
+include = ["pyarty*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

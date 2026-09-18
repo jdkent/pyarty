@@ -1,348 +1,514 @@
-"""Directory-to-bundle inference utilities."""
+"""Reading a directory back into a bundle instance.
+
+Reading is *lenient* by default, which is the asymmetry that makes the contract
+usable against real trees:
+
+* files that no field claims are ignored;
+* an ``Optional`` field with no match becomes ``None``;
+* a required field with no match raises :class:`MissingFileError`.
+
+Pass ``strict=True`` to also reject unclaimed files, which is how you assert
+that a tree contains *exactly* what the schema describes.
+
+Reading is driven entirely by the schema: each field globs for candidates, then
+parses them with its own pattern. Nothing is inferred from file extensions, so
+``File[dict]`` decodes as JSON because it was *declared* that way.
+"""
 
 from __future__ import annotations
 
-import json
-import keyword
-import re
-from collections import defaultdict
-from dataclasses import dataclass, make_dataclass
+from dataclasses import MISSING, fields as dataclass_fields
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
+from typing import Any, Mapping
 
-from .dsl import Dir, File, bundle, twig
+from .codecs import describe_annotation
+from .errors import MissingFileError, ReadError
+from .pattern import PathPattern
+from .schema import BundleField, FieldKind, bundle_schema, is_bundle
 
-
-__all__ = ["InferredBundle", "infer_bundle_from_directory"]
-
-
-SUPPORTED_EXTENSIONS = {".txt", ".json", ".jsonl"}
-
-
-@dataclass(frozen=True)
-class InferredBundle:
-    """Container for dynamically inferred bundle information."""
-
-    root_class: type[Any]
-    instance: Any
-    schema: Mapping[str, Any]
+__all__ = ["read_bundle"]
 
 
-def infer_bundle_from_directory(
-    directory: str | Path, *, root_class_name: str | None = None
-) -> InferredBundle:
-    """Infer a bundle dataclass tree and JSON Schema from ``directory``.
+def read_bundle(
+    cls: type[Any], path: str | Path, *, strict: bool = False
+) -> Any:
+    """Read directory ``path`` into an instance of bundle class ``cls``."""
+    if not is_bundle(cls):
+        raise ReadError(f"{getattr(cls, '__name__', cls)!r} is not a @bundle class.")
 
-    The resulting dataclass instances can be rendered back to disk via ``.write``.
+    base = Path(path).expanduser()
+    if not base.exists():
+        raise ReadError(f"Directory '{base}' does not exist.")
+    if not base.is_dir():
+        raise ReadError(f"'{base}' is not a directory.")
+
+    claimed: set[Path] = set()
+    instance = _read_into(
+        cls, base, inherited={}, claimed=claimed, strict=strict, depth=0, fixed={}
+    )
+
+    if strict:
+        _reject_unclaimed(base, claimed, cls)
+    return instance
+
+
+#: A recursive layout (Dir[list["Self"]]) could otherwise follow a symlink
+#: loop forever. Real trees are nowhere near this deep.
+MAX_DEPTH = 64
+
+
+def _read_into(
+    cls: type[Any],
+    base: Path,
+    *,
+    inherited: Mapping[str, Any],
+    claimed: set[Path],
+    strict: bool,
+    depth: int = 0,
+    fixed: Mapping[str, Any] = {},
+) -> Any:
+    """Build one instance of ``cls`` from directory ``base``.
+
+    ``inherited`` carries pattern variables captured by an ancestor's ``Dir``
+    pattern — this is how a name encoded in a directory name lands back in the
+    child's own field.
+
+    ``fixed`` is the narrower set of variables an enclosing ``Group`` has
+    pinned. Those *constrain* which files a pattern may match, because every
+    field of one record must agree on the record's key. ``inherited`` cannot be
+    used for that: a ``Dir`` pattern rebinds its variable at each level, so a
+    recursive layout would filter away its own grandchildren.
     """
-
-    root_path = Path(directory).expanduser().resolve()
-    if not root_path.exists() or not root_path.is_dir():
-        raise FileNotFoundError(f"Directory '{root_path}' does not exist or is not a directory.")
-
-    builder = _BundleBuilder(root_path, root_class_name)
-    root_cls, instance = builder.build()
-    schema = builder.schema()
-    return InferredBundle(root_cls, instance, schema)
-
-
-class _BundleBuilder:
-    def __init__(self, root_path: Path, root_override: str | None) -> None:
-        self.root_path = root_path
-        self.root_override = root_override
-        self._class_cache: dict[Path, type[Any]] = {}
-        self._instance_cache: dict[Path, Any] = {}
-        self._schema_defs: dict[str, Mapping[str, Any]] = {}
-        self._name_counts: MutableMapping[str, int] = defaultdict(int)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-    def build(self) -> tuple[type[Any], Any]:
-        return self._build_dir(self.root_path, preferred_name=self.root_override)
-
-    def schema(self) -> Mapping[str, Any]:
-        root_class = self._class_cache[self.root_path]
-        return {
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "$id": f"pyarty://{self.root_path.name}",
-            "$ref": f"#/$defs/{root_class.__name__}",
-            "$defs": dict(self._schema_defs),
-        }
-
-    # ------------------------------------------------------------------
-    # Builders
-    # ------------------------------------------------------------------
-    def _build_dir(
-        self, path: Path, *, preferred_name: str | None = None
-    ) -> tuple[type[Any], Any]:
-        if path in self._class_cache:
-            return self._class_cache[path], self._instance_cache[path]
-
-        class_name = self._unique_class_name(
-            preferred_name or (path.name or "root"),
-            trust_input=preferred_name is not None,
+    if depth > MAX_DEPTH:
+        raise ReadError(
+            f"Recursion limit ({MAX_DEPTH}) exceeded reading '{base}' as "
+            f"'{cls.__name__}'. A recursive layout may be following a "
+            "symlink loop."
         )
+    schema = bundle_schema(cls)
+    kwargs: dict[str, Any] = {}
+    captured: dict[str, Any] = dict(inherited)
 
-        entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name))
-        fields: list[tuple[str, Any, Any]] = []
-        init_kwargs: dict[str, Any] = {}
-        schema_properties: dict[str, Any] = {}
-        required_fields: list[str] = []
+    # Files first: their patterns may capture variables that value fields need.
+    for item in schema.by_kind(FieldKind.FILE):
+        value, found_vars = _read_file(item, base, cls, claimed, fixed)
+        if value is not _ABSENT:
+            kwargs[item.name] = value
+            captured.update(found_vars)
 
-        used_field_names: set[str] = set()
+    for item in schema.by_kind(FieldKind.FILES):
+        value, found_vars = _read_files(item, base, cls, claimed, fixed)
+        if value is not _ABSENT:
+            kwargs[item.name] = value
+            captured.update(found_vars)
 
-        for entry in entries:
-            if entry.is_dir():
-                child_cls, child_instance = self._build_dir(entry)
-                field_name = _unique_field_name(
-                    used_field_names, _snake_case(entry.name)
-                )
-                fields.append(
-                    (
-                        field_name,
-                        Dir[child_cls],
-                        twig(name=entry.name),
-                    )
-                )
-                init_kwargs[field_name] = child_instance
-                schema_properties[field_name] = {
-                    "$ref": f"#/$defs/{child_cls.__name__}",
-                    "description": f"Directory '{entry.name}'",
-                    "x-pyarty": {
-                        "kind": "dir",
-                        "path": self._relative(entry),
-                        "name": entry.name,
-                    },
-                }
-                required_fields.append(field_name)
-                continue
-
-            if entry.is_file():
-                suffix = entry.suffix.lower()
-                if suffix not in SUPPORTED_EXTENSIONS:
-                    raise ValueError(
-                        f"Unsupported file extension '{entry.suffix}' in '{entry}'."
-                    )
-                annotation, value, schema = self._build_file(entry)
-                field_name = _unique_field_name(
-                    used_field_names, _snake_case(entry.stem)
-                )
-                fields.append(
-                    (
-                        field_name,
-                        annotation,
-                        twig(name=entry.stem, extension=suffix.lstrip(".")),
-                    )
-                )
-                init_kwargs[field_name] = value
-                schema["x-pyarty"] = {
-                    "kind": "file",
-                    "path": self._relative(entry),
-                    "name": entry.name,
-                    "extension": suffix.lstrip("."),
-                }
-                schema_properties[field_name] = schema
-                required_fields.append(field_name)
-
-        namespace = {"__module__": __name__}
-        dataclass_type = make_dataclass(class_name, fields, namespace=namespace)
-        bundle_class = bundle(dataclass_type)
-        instance = bundle_class(**init_kwargs)
-
-        self._class_cache[path] = bundle_class
-        self._instance_cache[path] = instance
-        self._schema_defs[bundle_class.__name__] = self._directory_schema(
-            bundle_class.__name__, schema_properties, required_fields, path
+    for item in schema.by_kind(FieldKind.DIR):
+        value = _read_dir(
+            item, base, cls, captured, claimed, strict, depth, fixed
         )
-        return bundle_class, instance
+        if value is not _ABSENT:
+            kwargs[item.name] = value
 
-    def _build_file(self, path: Path) -> tuple[Any, Any, Dict[str, Any]]:
-        suffix = path.suffix.lower()
-        if suffix == ".txt":
-            contents = path.read_text(encoding="utf-8")
-            return File[str], contents, {"type": "string"}
-        if suffix == ".json":
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            annotation = File[self._annotation_for_json_value(payload)]
-            schema = _infer_json_schema(payload)
-            return annotation, payload, schema
-        if suffix == ".jsonl":
-            payload_list: list[Any] = []
-            with path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    stripped = line.rstrip("\n\r")
-                    if not stripped:
-                        continue
-                    payload_list.append(json.loads(stripped))
-            annotation = File[List[self._annotation_for_jsonl(payload_list)]]
-            schema = {
-                "type": "array",
-                "items": _merge_schemas(
-                    _infer_json_schema(entry) for entry in payload_list
-                ),
-            }
-            return annotation, payload_list, schema
-        raise ValueError(f"Unsupported file extension '{path.suffix}'.")
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    def _unique_class_name(self, base: str, *, trust_input: bool = False) -> str:
-        sanitized = (
-            _sanitize_class_name(base) if trust_input else _camelcase(base)
+    for item in schema.by_kind(FieldKind.GROUP):
+        value = _read_group(
+            item, base, cls, captured, claimed, strict, depth, fixed
         )
-        count = self._name_counts[sanitized]
-        self._name_counts[sanitized] += 1
-        if count == 0:
-            return sanitized
-        return f"{sanitized}{count+1}"
+        if value is not _ABSENT:
+            kwargs[item.name] = value
 
-    def _relative(self, target: Path) -> str:
-        rel = target.relative_to(self.root_path)
-        rel_str = rel.as_posix()
-        return rel_str if rel_str else "."
+    for item in schema.by_kind(FieldKind.VALUE):
+        value = _resolve_value(item, captured, cls, base)
+        if value is not _ABSENT:
+            kwargs[item.name] = value
 
-    def _directory_schema(
-        self,
-        class_name: str,
-        properties: Mapping[str, Any],
-        required: Sequence[str],
-        path: Path,
-    ) -> Mapping[str, Any]:
-        schema: Dict[str, Any] = {
-            "title": class_name,
-            "type": "object",
-            "properties": properties,
-            "additionalProperties": False,
-            "x-pyarty": {
-                "kind": "dir",
-                "path": self._relative(path),
-                "name": path.name or "root",
-            },
-        }
-        if required:
-            schema["required"] = list(required)
-        return schema
-
-    def _annotation_for_json_value(self, value: Any) -> Any:
-        if isinstance(value, dict):
-            return Dict[str, Any]
-        if isinstance(value, list):
-            return List[Any]
-        if isinstance(value, bool):
-            return bool
-        if isinstance(value, int):
-            return int
-        if isinstance(value, float):
-            return float
-        if value is None:
-            return Any
-        return str
-
-    def _annotation_for_jsonl(self, items: list[Any]) -> Any:
-        if not items:
-            return Dict[str, Any]
-        first = items[0]
-        if isinstance(first, dict):
-            return Dict[str, Any]
-        if isinstance(first, list):
-            return List[Any]
-        if isinstance(first, bool):
-            return bool
-        if isinstance(first, int):
-            return int
-        if isinstance(first, float):
-            return float
-        if first is None:
-            return Any
-        return str
+    try:
+        return cls(**kwargs)
+    except TypeError as exc:
+        missing = _missing_required(cls, kwargs)
+        detail = (
+            f" Missing: {', '.join(missing)}." if missing else ""
+        )
+        raise ReadError(
+            f"Could not construct '{cls.__name__}' from '{base}': {exc}.{detail}"
+        ) from exc
 
 
-def _merge_schemas(schemas: Iterable[Mapping[str, Any]]) -> Mapping[str, Any]:
-    unique: list[Mapping[str, Any]] = []
-    signatures: set[str] = set()
-    for schema in schemas:
-        key = json.dumps(schema, sort_keys=True)
-        if key in signatures:
+def _agrees(found: Mapping[str, Any], bound: Mapping[str, Any]) -> bool:
+    """Whether captured variables match the values already known from context.
+
+    A variable fixed by an enclosing ``Dir`` or ``Group`` must constrain the
+    candidates a pattern will accept. Without this a record inside a group
+    would glob its whole parallel tree and match every sibling's file.
+    """
+    for name, value in found.items():
+        if name in bound and str(bound[name]) != str(value):
+            return False
+    return True
+
+
+class _Absent:
+    """Marker distinguishing "no value" from a legitimate ``None``."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<absent>"
+
+
+_ABSENT = _Absent()
+
+
+# ----------------------------------------------------------------------
+# Files
+# ----------------------------------------------------------------------
+def _read_file(
+    item: BundleField,
+    base: Path,
+    cls: type[Any],
+    claimed: set[Path],
+    bound: Mapping[str, Any] = {},
+) -> tuple[Any, dict[str, Any]]:
+    assert item.pattern is not None and item.codec is not None
+    pattern = item.pattern
+    where = f"{cls.__name__}.{item.name}"
+
+    # A copy field whose pattern has no extension kept the source's on write.
+    glob = pattern.glob()
+    match_pattern: PathPattern | None = pattern
+    if item.is_copy and not pattern.suffix:
+        glob = f"{glob}.*"
+        match_pattern = None
+
+    matches: list[tuple[Path, dict[str, str]]] = []
+    for candidate in sorted(base.glob(glob)):
+        if not candidate.is_file():
             continue
-        signatures.add(key)
-        unique.append(schema)
-    if not unique:
-        return {}
-    if len(unique) == 1:
-        return unique[0]
-    return {"anyOf": unique}
+        relative = candidate.relative_to(base).as_posix()
+        if match_pattern is None:
+            matches.append((candidate, {}))
+            continue
+        found = match_pattern.match(relative)
+        if found is not None and _agrees(found, bound):
+            matches.append((candidate, found))
+
+    if not matches:
+        if item.optional or item.has_default:
+            return (None if item.optional else _ABSENT), {}
+        raise MissingFileError(
+            f"No file matching '{pattern}' for required field '{where}' "
+            f"under '{base}'."
+        )
+
+    if len(matches) > 1:
+        listed = ", ".join(p.name for p, _ in matches[:5])
+        raise ReadError(
+            f"Field '{where}' pattern '{pattern}' matched "
+            f"{len(matches)} files under '{base}' ({listed}"
+            f"{', ...' if len(matches) > 5 else ''}). A File[...] field must "
+            "match exactly one; use Dir[list[...]] for repeated structure."
+        )
+
+    found_path, found_vars = matches[0]
+    claimed.add(found_path)
+
+    if item.is_copy:
+        return found_path, found_vars
+
+    raw = found_path.read_bytes()
+    try:
+        return item.codec.decode(raw), found_vars
+    except Exception as exc:
+        raise ReadError(
+            f"Field '{where}' declared File[{describe_annotation(item.payload)}] "
+            f"could not decode '{found_path}' as {item.codec.name}: {exc}"
+        ) from exc
 
 
-def _infer_json_schema(value: Any) -> Dict[str, Any]:
-    if value is None:
-        return {"type": "null"}
-    if isinstance(value, bool):
-        return {"type": "boolean"}
-    if isinstance(value, int) and not isinstance(value, bool):
-        return {"type": "integer"}
-    if isinstance(value, float):
-        return {"type": "number"}
-    if isinstance(value, str):
-        return {"type": "string"}
-    if isinstance(value, list):
-        schema: Dict[str, Any] = {"type": "array"}
-        if value:
-            schema["items"] = _merge_schemas(
-                _infer_json_schema(entry) for entry in value
+def _read_files(
+    item: BundleField,
+    base: Path,
+    cls: type[Any],
+    claimed: set[Path],
+    bound: Mapping[str, Any] = {},
+) -> tuple[Any, dict[str, Any]]:
+    """Read every file matching a ``Files`` pattern into a mapping.
+
+    Unlike ``File``, matching many files is the expected case; matching none
+    yields an empty mapping rather than an error, since "no shards yet" is a
+    normal state for a directory that is still being filled.
+
+    Returns the mapping plus any *non-key* variables the pattern captured.
+    Those describe the field as a whole rather than one entry (the ``total`` in
+    ``model-{shard}-of-{total}.safetensors``), so they feed sibling value
+    fields exactly as a ``File`` pattern's captures do, and must agree across
+    every match.
+    """
+    assert item.pattern is not None and item.codec is not None and item.key
+    where = f"{cls.__name__}.{item.name}"
+    found: dict[Any, Any] = {}
+    shared: dict[str, Any] = {}
+
+    for candidate in sorted(base.glob(item.pattern.glob())):
+        if not candidate.is_file():
+            continue
+        relative = candidate.relative_to(base).as_posix()
+        variables = item.pattern.match(relative)
+        if variables is None or item.key not in variables:
+            continue
+        if not _agrees(variables, bound):
+            continue
+
+        for name, value in variables.items():
+            if name == item.key:
+                continue
+            if name in shared and shared[name] != value:
+                raise ReadError(
+                    f"Field '{where}' pattern '{item.pattern}' captured "
+                    f"conflicting values for '{{{name}}}': "
+                    f"{shared[name]!r} and {value!r}. A variable other than "
+                    f"the key '{{{item.key}}}' describes the whole field, so "
+                    "it must be the same in every matching filename."
+                )
+            shared[name] = value
+
+        key = _coerce(variables[item.key], item.key_type)
+        if key in found:
+            raise ReadError(
+                f"Field '{where}' found two files with key {key!r} under "
+                f"'{base}'. The key variable '{{{item.key}}}' must be unique "
+                "across matches."
             )
-        return schema
-    if isinstance(value, dict):
-        properties = {
-            key: _infer_json_schema(inner) for key, inner in sorted(value.items())
-        }
-        schema = {"type": "object"}
-        if properties:
-            schema["properties"] = properties
-            schema["required"] = list(properties.keys())
-        return schema
-    return {"type": "string"}
+        claimed.add(candidate)
+
+        if item.is_copy:
+            found[key] = candidate
+            continue
+        try:
+            found[key] = item.codec.decode(candidate.read_bytes())
+        except Exception as exc:
+            raise ReadError(
+                f"Field '{where}' declared Files[..., "
+                f"{describe_annotation(item.payload)}] could not decode "
+                f"'{candidate}' as {item.codec.name}: {exc}"
+            ) from exc
+
+    if not found and item.has_default:
+        return _ABSENT, shared
+    return found, shared
 
 
-def _camelcase(value: str) -> str:
-    tokens = re.split(r"[^0-9a-zA-Z]+", value)
-    filtered = [token for token in tokens if token]
-    if not filtered:
-        return "Node"
-    combined = "".join(token.capitalize() for token in filtered)
-    if combined[0].isdigit():
-        combined = f"N{combined}"
-    return combined
+# ----------------------------------------------------------------------
+# Directories
+# ----------------------------------------------------------------------
+def _read_dir(
+    item: BundleField,
+    base: Path,
+    cls: type[Any],
+    captured: Mapping[str, Any],
+    claimed: set[Path],
+    strict: bool,
+    depth: int = 0,
+    bound: Mapping[str, Any] = {},
+) -> Any:
+    assert item.pattern is not None and item.child is not None
+    pattern = item.pattern
+    where = f"{cls.__name__}.{item.name}"
+
+    matches: list[tuple[Path, dict[str, str]]] = []
+    for candidate in sorted(base.glob(pattern.glob())):
+        if not candidate.is_dir():
+            continue
+        relative = candidate.relative_to(base).as_posix()
+        found = pattern.match(relative)
+        if found is not None and _agrees(found, bound):
+            matches.append((candidate, found))
+
+    if item.is_collection:
+        children = [
+            _read_into(
+                item.child,
+                directory,
+                inherited={**captured, **found},
+                claimed=claimed,
+                strict=strict,
+                depth=depth + 1,
+                fixed=bound,
+            )
+            for directory, found in matches
+        ]
+        if not children and (item.optional or item.has_default):
+            return _ABSENT if item.has_default else []
+        return children
+
+    if not matches:
+        if item.optional or item.has_default:
+            return None if item.optional else _ABSENT
+        raise MissingFileError(
+            f"No directory matching '{pattern}' for required field '{where}' "
+            f"under '{base}'."
+        )
+    if len(matches) > 1:
+        raise ReadError(
+            f"Field '{where}' pattern '{pattern}' matched {len(matches)} "
+            f"directories under '{base}'. Declare it as Dir[list[...]] to "
+            "accept more than one."
+        )
+
+    directory, found = matches[0]
+    return _read_into(
+        item.child,
+        directory,
+        inherited={**captured, **found},
+        claimed=claimed,
+        strict=strict,
+        depth=depth + 1,
+        fixed=bound,
+    )
 
 
-def _sanitize_class_name(value: str) -> str:
-    if not value:
-        return "Node"
-    filtered = re.sub(r"[^0-9a-zA-Z]+", "", value)
-    if not filtered:
-        filtered = "Node"
-    if filtered[0].isdigit():
-        filtered = f"N{filtered}"
-    return filtered
+# ----------------------------------------------------------------------
+# Groups
+# ----------------------------------------------------------------------
+def _read_group(
+    item: BundleField,
+    base: Path,
+    cls: type[Any],
+    captured: Mapping[str, Any],
+    claimed: set[Path],
+    strict: bool,
+    depth: int,
+    fixed: Mapping[str, Any] = {},
+) -> Any:
+    """Assemble records that span parallel trees under one directory.
+
+    The records share a key variable, so discovery means collecting every value
+    that key takes across the child's patterns, then reading one record per
+    value — each rooted at ``base``, not in a subdirectory of its own.
+    """
+    assert item.child is not None and item.key
+    root = base
+    if item.pattern is not None:
+        # Validated static at declaration time, so no scope is needed.
+        root = base / item.pattern.format({})
+    if not root.is_dir():
+        return _ABSENT if item.has_default else []
+
+    keys = _discover_group_keys(item.child, root, item.key)
+    if not keys and item.has_default:
+        return _ABSENT
+
+    return [
+        _read_into(
+            item.child,
+            root,
+            inherited={**captured, item.key: key},
+            claimed=claimed,
+            strict=strict,
+            depth=depth + 1,
+            # Pin the key so every field of this record matches only its own
+            # files, rather than globbing the whole parallel tree.
+            fixed={**fixed, item.key: key},
+        )
+        for key in keys
+    ]
 
 
-def _snake_case(value: str) -> str:
-    value = re.sub(r"[^0-9a-zA-Z]+", "_", value).strip("_")
-    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
-    lowered = value.lower() or "node"
-    if lowered[0].isdigit():
-        lowered = f"n_{lowered}"
-    if keyword.iskeyword(lowered):
-        lowered = f"{lowered}_" 
-    return lowered
+def _discover_group_keys(child: type[Any], root: Path, key: str) -> list[str]:
+    """Every value ``key`` takes across the child's patterns, sorted.
+
+    The union rather than the intersection: a record missing one of its files
+    should surface through that field's own required/optional rules, not vanish.
+    """
+    found: set[str] = set()
+    for item in bundle_schema(child).fields:
+        if item.pattern is None or key not in item.pattern.variables:
+            continue
+        wants_dir = item.kind is FieldKind.DIR
+        for candidate in root.glob(item.pattern.glob()):
+            if candidate.is_dir() != wants_dir:
+                continue
+            variables = item.pattern.match(
+                candidate.relative_to(root).as_posix()
+            )
+            if variables is not None and key in variables:
+                found.add(variables[key])
+    return sorted(found)
 
 
-def _unique_field_name(existing: set[str], candidate: str) -> str:
-    base = candidate
-    counter = 1
-    while candidate in existing:
-        counter += 1
-        candidate = f"{base}_{counter}"
-    existing.add(candidate)
-    return candidate
+# ----------------------------------------------------------------------
+# Plain values
+# ----------------------------------------------------------------------
+def _resolve_value(
+    item: BundleField,
+    captured: Mapping[str, Any],
+    cls: type[Any],
+    base: Path,
+) -> Any:
+    if item.name in captured:
+        return _coerce(captured[item.name], item.annotation)
+    if item.has_default:
+        return _ABSENT
+    if item.optional:
+        return None
+    raise ReadError(
+        f"Field '{item.name}' on '{cls.__name__}' is a plain value, but no "
+        f"pattern captured '{{{item.name}}}' while reading '{base}', so its "
+        f"value cannot be recovered.\n"
+        f"  Reference it in a sibling pattern — e.g. "
+        f"at(\"{{{item.name}}}.txt\") — or have the parent name the directory "
+        f"with at(\".../{{{item.name}}}\"), or give the field a default."
+    )
+
+
+def _coerce(raw: Any, annotation: Any) -> Any:
+    """Convert a captured path fragment to the field's declared type.
+
+    Pattern captures are always strings; a field declared ``int`` should get an
+    ``int`` back so the round trip compares equal.
+    """
+    from .codecs import unwrap_optional
+
+    target, _ = unwrap_optional(annotation)
+    if not isinstance(raw, str) or target is str:
+        return raw
+    if target is int:
+        try:
+            return int(raw)
+        except ValueError:
+            return raw
+    if target is float:
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
+    if target is bool:
+        lowered = raw.lower()
+        if lowered in ("true", "false"):
+            return lowered == "true"
+    return raw
+
+
+# ----------------------------------------------------------------------
+# Strict mode
+# ----------------------------------------------------------------------
+def _reject_unclaimed(base: Path, claimed: set[Path], cls: type[Any]) -> None:
+    unclaimed = sorted(
+        p for p in base.rglob("*") if p.is_file() and p not in claimed
+    )
+    if not unclaimed:
+        return
+    listed = ", ".join(p.relative_to(base).as_posix() for p in unclaimed[:5])
+    raise ReadError(
+        f"strict=True: '{base}' contains {len(unclaimed)} file(s) that no "
+        f"field of '{cls.__name__}' claims ({listed}"
+        f"{', ...' if len(unclaimed) > 5 else ''}). "
+        f"Declare them, or read with strict=False to ignore them."
+    )
+
+
+def _missing_required(cls: type[Any], supplied: Mapping[str, Any]) -> list[str]:
+    missing: list[str] = []
+    for item in dataclass_fields(cls):
+        if item.name in supplied:
+            continue
+        if item.default is MISSING and item.default_factory is MISSING:
+            missing.append(item.name)
+    return missing
