@@ -43,11 +43,18 @@ def read_bundle(
         raise ReadError(f"'{base}' is not a directory.")
 
     claimed: set[Path] = set()
-    instance = _read_into(cls, base, inherited={}, claimed=claimed, strict=strict)
+    instance = _read_into(
+        cls, base, inherited={}, claimed=claimed, strict=strict, depth=0
+    )
 
     if strict:
         _reject_unclaimed(base, claimed, cls)
     return instance
+
+
+#: A recursive layout (Dir[list["Self"]]) could otherwise follow a symlink
+#: loop forever. Real trees are nowhere near this deep.
+MAX_DEPTH = 64
 
 
 def _read_into(
@@ -57,6 +64,7 @@ def _read_into(
     inherited: Mapping[str, Any],
     claimed: set[Path],
     strict: bool,
+    depth: int = 0,
 ) -> Any:
     """Build one instance of ``cls`` from directory ``base``.
 
@@ -64,6 +72,12 @@ def _read_into(
     pattern — this is how a name encoded in a directory name lands back in the
     child's own field.
     """
+    if depth > MAX_DEPTH:
+        raise ReadError(
+            f"Recursion limit ({MAX_DEPTH}) exceeded reading '{base}' as "
+            f"'{cls.__name__}'. A recursive layout may be following a "
+            "symlink loop."
+        )
     schema = bundle_schema(cls)
     kwargs: dict[str, Any] = {}
     captured: dict[str, Any] = dict(inherited)
@@ -75,8 +89,14 @@ def _read_into(
             kwargs[item.name] = value
             captured.update(found_vars)
 
+    for item in schema.by_kind(FieldKind.FILES):
+        value, found_vars = _read_files(item, base, cls, claimed)
+        if value is not _ABSENT:
+            kwargs[item.name] = value
+            captured.update(found_vars)
+
     for item in schema.by_kind(FieldKind.DIR):
-        value = _read_dir(item, base, cls, captured, claimed, strict)
+        value = _read_dir(item, base, cls, captured, claimed, strict, depth)
         if value is not _ABSENT:
             kwargs[item.name] = value
 
@@ -172,6 +192,76 @@ def _read_file(
         ) from exc
 
 
+def _read_files(
+    item: BundleField,
+    base: Path,
+    cls: type[Any],
+    claimed: set[Path],
+) -> tuple[Any, dict[str, Any]]:
+    """Read every file matching a ``Files`` pattern into a mapping.
+
+    Unlike ``File``, matching many files is the expected case; matching none
+    yields an empty mapping rather than an error, since "no shards yet" is a
+    normal state for a directory that is still being filled.
+
+    Returns the mapping plus any *non-key* variables the pattern captured.
+    Those describe the field as a whole rather than one entry (the ``total`` in
+    ``model-{shard}-of-{total}.safetensors``), so they feed sibling value
+    fields exactly as a ``File`` pattern's captures do, and must agree across
+    every match.
+    """
+    assert item.pattern is not None and item.codec is not None and item.key
+    where = f"{cls.__name__}.{item.name}"
+    found: dict[Any, Any] = {}
+    shared: dict[str, Any] = {}
+
+    for candidate in sorted(base.glob(item.pattern.glob())):
+        if not candidate.is_file():
+            continue
+        relative = candidate.relative_to(base).as_posix()
+        variables = item.pattern.match(relative)
+        if variables is None or item.key not in variables:
+            continue
+
+        for name, value in variables.items():
+            if name == item.key:
+                continue
+            if name in shared and shared[name] != value:
+                raise ReadError(
+                    f"Field '{where}' pattern '{item.pattern}' captured "
+                    f"conflicting values for '{{{name}}}': "
+                    f"{shared[name]!r} and {value!r}. A variable other than "
+                    f"the key '{{{item.key}}}' describes the whole field, so "
+                    "it must be the same in every matching filename."
+                )
+            shared[name] = value
+
+        key = _coerce(variables[item.key], item.key_type)
+        if key in found:
+            raise ReadError(
+                f"Field '{where}' found two files with key {key!r} under "
+                f"'{base}'. The key variable '{{{item.key}}}' must be unique "
+                "across matches."
+            )
+        claimed.add(candidate)
+
+        if item.is_copy:
+            found[key] = candidate
+            continue
+        try:
+            found[key] = item.codec.decode(candidate.read_bytes())
+        except Exception as exc:
+            raise ReadError(
+                f"Field '{where}' declared Files[..., "
+                f"{describe_annotation(item.payload)}] could not decode "
+                f"'{candidate}' as {item.codec.name}: {exc}"
+            ) from exc
+
+    if not found and item.has_default:
+        return _ABSENT, shared
+    return found, shared
+
+
 # ----------------------------------------------------------------------
 # Directories
 # ----------------------------------------------------------------------
@@ -182,6 +272,7 @@ def _read_dir(
     captured: Mapping[str, Any],
     claimed: set[Path],
     strict: bool,
+    depth: int = 0,
 ) -> Any:
     assert item.pattern is not None and item.child is not None
     pattern = item.pattern
@@ -204,6 +295,7 @@ def _read_dir(
                 inherited={**captured, **found},
                 claimed=claimed,
                 strict=strict,
+                depth=depth + 1,
             )
             for directory, found in matches
         ]
@@ -232,6 +324,7 @@ def _read_dir(
         inherited={**captured, **found},
         claimed=claimed,
         strict=strict,
+        depth=depth + 1,
     )
 
 

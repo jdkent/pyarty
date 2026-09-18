@@ -4,7 +4,7 @@ meta:
     A two-way contract between directory trees and Python dataclasses. Fields
     declare where they live with bidirectional relative path patterns, so a
     bundle can be written to disk and read back into the same class.
-  iteration: "v0.2-bidirectional"
+  iteration: "v0.3-repetition-and-recursion"
   updated: "2026-09-18"
 
 purpose:
@@ -39,9 +39,30 @@ design:
     it removes the need for any naming-hint configuration.
   field_kinds:
     - "File[T]: one file; T selects the codec."
+    - "Files[dict[K, T]]: many files sharing one pattern, keyed by one variable."
     - "Dir[T]: one subdirectory described by another bundle."
     - "Dir[list[T]]: one subdirectory per element; pattern must vary per child."
+    - "Dir[list[Self]]: recursive trees; a bundle may contain itself."
     - "Any other annotation: a plain value, captured from a pattern variable."
+  pattern_syntax:
+    - "{name}: a variable, rendered on write and parsed on read."
+    - "{name:charset}: restricted to any/word/alnum/alpha/digits/hex."
+    - "[...]: an optional group, dropped when its variables are all None."
+    - "A repeated variable is a backreference; every occurrence must agree."
+    - "Brackets wrapping no variable stay literal, so a[1].txt is a filename."
+  why_mapping_only: >
+    Files has no list form on purpose. A bare list of payloads cannot tell
+    write what to name each file, so it could not round trip. The mapping key
+    supplies one variable; the rest resolve against the owning instance and
+    are read back into their own fields.
+  prior_art: >
+    pybids (bids.layout.writing.build_path) independently arrived at nearly
+    this pattern language, including [...] optional groups and per-variable
+    value constraints, and pairs it with parse_file_entities for the reverse
+    direction. That convergence validates the design, and is the reason this
+    package stays domain-neutral rather than shipping BIDS support: popular
+    standards already have libraries that own naming plus the semantics
+    pyarty does not touch. The value is in the unstandardized long tail.
   variable_resolution: >
     Pattern variables resolve against the object being named: a File pattern
     against its owner, a Dir pattern against the child it names, falling back
@@ -60,6 +81,9 @@ constraints:
     - "`at(pattern)` declares placement; omitting it defaults to field name plus codec extension."
     - "An extension written into a pattern overrides the codec default."
     - "`Dir[list[T]]` whose final pattern segment has no variable raises LayoutError on declaration."
+    - "`Files[...]` with a static pattern, a list container, or an ambiguous key raises SpecError on declaration."
+    - "A `Files` non-key variable must agree across every matching filename."
+    - "Recursive reads are bounded by MAX_DEPTH to survive symlink loops."
     - "Two fields resolving to one literal path raise LayoutError on declaration."
     - "A pattern variable naming no field raises SpecError on declaration."
     - "A pattern value containing a path separator raises PatternError, blocking traversal."
@@ -78,7 +102,7 @@ constraints:
 
 interfaces:
   public_api:
-    - "bundle, at, File, Dir"
+    - "bundle, at, File, Files, Dir"
     - "write_bundle, read_bundle, plan_bundle"
     - "bundle_schema, is_bundle, BundleSchema, BundleField, FieldKind, PathSpec"
     - "PathPattern, Codec, codec_for_annotation"
@@ -123,6 +147,8 @@ development:
     - "test_writer: strict payload validation, atomicity, overwrite, collections, copy."
     - "test_reader: leniency, strict mode, optionals, ambiguity, error messages."
     - "test_scaffold: generated source compiles, reads its own tree, inverts write."
+    - "test_files: Files against BagIt, HuggingFace shards, BIDS runs, YOLO."
+    - "test_recursive: self-referential bundles, depth, recursion limit."
   folder_structure:
     - "pyarty/{pattern,codecs,schema,writer,reader,scaffold,errors}.py"
     - "tests/"
@@ -133,6 +159,7 @@ development:
     - "use pytest"
 
 future:
+  - "Cross-tree grouping: one record spanning parallel trees (images/ + labels/)."
   - "CLI for scaffold/validate/render workflows."
   - "Pluggable codec registry (Parquet/CSV/images)."
   - "fsspec backends (S3/GCS)."

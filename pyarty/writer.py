@@ -7,10 +7,11 @@ directory or raises without leaving a half-written one behind.
 
 from __future__ import annotations
 
+import collections.abc as abc
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .codecs import describe_annotation
 from .errors import PayloadTypeError, WriteError
@@ -120,6 +121,8 @@ def _plan(
 
         if item.kind is FieldKind.FILE:
             into.append(_plan_file(item, value, instance, prefix, where))
+        elif item.kind is FieldKind.FILES:
+            _plan_files(item, value, instance, prefix, where, into)
         else:
             _plan_dir(item, value, instance, prefix, where, into)
 
@@ -130,8 +133,12 @@ def _plan_file(
     owner: Any,
     prefix: str,
     where: str,
+    *,
+    scope_override: Mapping[str, Any] | None = None,
 ) -> _PlannedFile:
+    """Plan one file. ``scope_override`` is used by ``Files`` to inject its key."""
     assert item.pattern is not None and item.codec is not None
+    scope = scope_override if scope_override is not None else _variables(owner)
 
     if item.is_copy:
         source = _resolve_source(value, where)
@@ -139,7 +146,7 @@ def _plan_file(
         if not pattern.suffix and source.suffix:
             # Preserve the source extension so read() can find it again.
             pattern = pattern.with_suffix(source.suffix)
-        relative = _join(prefix, pattern.format(_variables(owner)))
+        relative = _join(prefix, pattern.format(scope))
         return _PlannedFile(
             relative_path=relative, payload=None, copy_from=source, origin=where
         )
@@ -159,10 +166,45 @@ def _plan_file(
             f"Field '{where}' could not be encoded as {item.codec.name}: {exc}"
         ) from exc
 
-    relative = _join(prefix, item.pattern.format(_variables(owner)))
+    relative = _join(prefix, item.pattern.format(scope))
     return _PlannedFile(
         relative_path=relative, payload=payload, copy_from=None, origin=where
     )
+
+
+def _plan_files(
+    item: BundleField,
+    value: Any,
+    owner: Any,
+    prefix: str,
+    where: str,
+    into: list[_PlannedFile],
+) -> None:
+    """Plan one file per entry of a ``Files`` mapping.
+
+    The mapping key supplies the field's key variable; every other variable in
+    the pattern resolves against the owning instance.
+    """
+    if not isinstance(value, abc.Mapping):
+        raise PayloadTypeError(
+            f"Field '{where}' is declared Files[dict[...]] and expects a "
+            f"mapping of key -> payload; got {type(value).__name__}."
+        )
+
+    owner_scope = _variables(owner)
+    for key, payload in value.items():
+        if key is None or str(key) == "":
+            raise PayloadTypeError(
+                f"Field '{where}' has an empty key; it names a file, so it "
+                "cannot be blank."
+            )
+        entry = f"{where}[{key!r}]"
+        scope = {**owner_scope, item.key: key}
+        # A single-entry view of the field, reusing the File planner so copy
+        # handling and payload validation stay in one place.
+        into.append(
+            _plan_file(item, payload, owner, prefix, entry, scope_override=scope)
+        )
 
 
 def _plan_dir(

@@ -72,6 +72,7 @@ That is the entire model. Every field is exactly one of:
 | Annotation | Means | Round-trips as |
 |---|---|---|
 | `File[T]` | one file, `T` picks the format | file contents |
+| `Files[dict[K, T]]` | **many** files sharing one pattern | mapping, keyed from the path |
 | `Dir[T]` | one subdirectory | nested bundle |
 | `Dir[list[T]]` | one subdirectory per element | nested bundles |
 | anything else | a plain value | **captured from the path** |
@@ -149,6 +150,62 @@ class Defaults:
     config: File[dict]         # -> config.json
     rows: File[list[dict]]     # -> rows.jsonl
 ```
+
+## Many files, one pattern
+
+`File[...]` matches exactly one file. When a pattern should match *many* —
+shards, checksums, runs, per-image labels — use `Files[dict[key, payload]]`:
+
+```python
+@bundle
+class Bag:
+    declaration: File[str]           = at("bagit.txt")
+    manifests: Files[dict[str, str]] = at("manifest-{algorithm}.txt")
+
+Bag(declaration="BagIt-Version: 1.0",
+    manifests={"md5": "...", "sha512": "..."}).write("./bag")
+# bag/{bagit.txt, manifest-md5.txt, manifest-sha512.txt}
+```
+
+The mapping key supplies one pattern variable; **any other variable resolves
+against the owning instance**, and is read back into its own field:
+
+```python
+@bundle
+class Repo:
+    total: str
+    shards: Files[dict[str, bytes]] = at(
+        "model-{shard:digits}-of-{total:digits}.safetensors", key="shard")
+
+# model-00001-of-00002.safetensors, model-00002-of-00002.safetensors
+# read back: shards={"00001": ..., "00002": ...}, total="00002"
+```
+
+`key=` names the keying variable; it defaults to the pattern's only variable
+and is required when there is more than one. Declare the key as `dict[int, T]`
+and it comes back an `int`. Matching no files gives an empty mapping rather
+than an error, since a partly-filled directory is a normal state.
+
+Only the mapping form exists. A `Files[list[T]]` is rejected at declaration
+time, because a bare list of payloads cannot tell `write` what to name each
+file — it could not round-trip.
+
+## Recursive layouts
+
+A bundle may contain itself, for trees of unbounded depth:
+
+```python
+@bundle
+class Catalog:
+    catalog: File[dict] = at("catalog.json")
+    children: Dir[list["Catalog"]] = at("{child_id}", default_factory=list)
+    child_id: str = "root"    # the root has no parent to name it
+```
+
+Reading recurses until no subdirectory matches. Note that fields with defaults
+must come last, as in any dataclass — so a collection field usually wants
+`default_factory=list` (or `dict`) both to satisfy that ordering and to let
+leaves omit it.
 
 ## Formats come from the annotation
 
