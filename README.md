@@ -96,6 +96,49 @@ Variables resolve against **the object being named**: for a `File`, its owner;
 for a `Dir`, the child it names, falling back to the owner. There is no
 "is this variable mine or my child's" flag to remember.
 
+### Constraining a variable
+
+By default a variable matches anything except `/`, which silently mis-parses
+delimited names — the wrong capture is indistinguishable from a real match:
+
+```python
+at("sub-{sub}_task-{task}_bold.nii")
+# "sub-01_ses-pre_task-rest_bold.nii" -> sub='01_ses-pre'   silently wrong
+```
+
+Add a character class to make that a clean non-match:
+
+```python
+at("sub-{sub:alnum}_task-{task:alnum}_bold.nii")
+# "sub-01_ses-pre_task-rest_bold.nii" -> no match
+```
+
+Available: `any` (default), `alnum`, `alpha`, `digits`, `word`, `hex`. A value
+that violates the class is refused on write, too. Pass `charset=` to set the
+default for every unqualified variable in one pattern.
+
+### Optional parts
+
+`[...]` marks a group that is dropped when its variables are `None`, for naming
+schemes with optional components:
+
+```python
+@bundle
+class Bold:
+    sub: str
+    task: str
+    image: File[bytes] = at("sub-{sub}[_ses-{ses}]_task-{task}_bold.nii")
+    ses: str | None = None
+
+Bold(sub="01", task="rest", ses=None,  image=b"")  # sub-01_task-rest_bold.nii
+Bold(sub="01", task="rest", ses="pre", image=b"")  # sub-01_ses-pre_task-rest_bold.nii
+```
+
+Both parse back, and an omitted variable reads as `None`. A group is all-or-
+nothing: filling some of its variables and not others is an error, since the
+result would not parse back. Brackets containing no variable are literal, so
+`at("a[1].txt")` still means the file named `a[1].txt`.
+
 Omit the pattern and you get the field name plus the format's extension, which
 covers the common case with no annotation at all:
 
