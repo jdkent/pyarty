@@ -1,181 +1,140 @@
 meta:
   project_name: "pyarty"
   description: >
-    Dataclass-driven DSL for describing filesystem bundles and a writer that
-    materializes bundle instances to disk using metadata-aware naming and
-    lightweight serialization.
-  iteration: "v0.1-dsl-writer"
-  updated: "2025-11-14"
+    A two-way contract between directory trees and Python dataclasses. Fields
+    declare where they live with bidirectional relative path patterns, so a
+    bundle can be written to disk and read back into the same class.
+  iteration: "v0.2-bidirectional"
+  updated: "2026-09-18"
 
 purpose:
   problem: >
     Pipeline outputs, experiment bundles, and structured result directories are
-    typically built with ad-hoc code. There is no standard for describing these
-    layouts, validating them, or reconstructing them from Python objects. This
-    library provides a declarative, schema-first approach that supports humans
-    and AI agents authoring bundle specifications.
+    built with ad-hoc path juggling. The previous iteration of pyarty could
+    only render dataclasses to disk: naming used str.format templates, which
+    have no inverse, so a value baked into a filename was unrecoverable and
+    reading a tree could only produce a freshly generated look-alike class
+    rather than the one already declared.
   goals:
-    - "Provide a Python DSL for declaring filesystem bundles with Dir[T] and File[T] markers."
-    - "Normalize metadata for bundle fields, including naming templates, runtime references, and extensions."
-    - "Infer sensible default file extensions from type annotations."
-    - "Render bundle instances to disk with predictable naming and basic serialization support."
+    - "Make read the exact inverse of write, for the user's own class."
+    - "Express placement as one bidirectional path pattern per field."
+    - "Pick serialization from the declared annotation, never the runtime value."
+    - "Reject layouts that cannot round-trip at class-declaration time."
     - "Keep the base installation dependency-free."
   non_goals:
-    - "No built-in workflow execution, DAGs, or pipeline scheduling."
-    - "No automatic schema inference or validation in the current release."
-    - "No persistence of runtime data beyond writing to disk."
-    - "No automatic regeneration of Python dataclasses from serialized specs."
+    - "No workflow execution, DAGs, or pipeline scheduling."
+    - "No remote/object-store backends in this iteration."
+    - "No schema migration between incompatible layouts."
   users:
     - "Data engineers writing pipeline output bundles."
     - "Researchers generating reproducible analysis output trees."
     - "Library authors defining reusable fixture or test directory layouts."
-    - "AI agents generating or modifying structured output schemas."
+    - "AI agents generating or consuming structured output schemas."
+
+design:
+  core_insight: >
+    Invertibility is the whole product. A str.format template can only render;
+    a pattern can render *and* parse. Making PathPattern the single source of
+    truth for placement is what allows Bundle.read(Bundle.write(x)) == x, and
+    it removes the need for any naming-hint configuration.
+  field_kinds:
+    - "File[T]: one file; T selects the codec."
+    - "Dir[T]: one subdirectory described by another bundle."
+    - "Dir[list[T]]: one subdirectory per element; pattern must vary per child."
+    - "Any other annotation: a plain value, captured from a pattern variable."
+  variable_resolution: >
+    Pattern variables resolve against the object being named: a File pattern
+    against its owner, a Dir pattern against the child it names, falling back
+    to the owner. This replaces the previous ("self" / "field") hint-source
+    tuples, which required remembering which side a variable came from.
+  strictness: >
+    Write is strict and all-or-nothing: the full tree is planned and validated
+    in memory before any byte is written, so a failure never leaves a partial
+    directory. Read is lenient: unclaimed files are ignored and optional
+    fields become None, because real trees carry extra files. strict=True
+    asserts an exact match.
 
 constraints:
   functional:
-    - "`@bundle` decorator converts dataclasses, records field metadata, and attaches a `.write()` helper."
-    - "`Dir[T]` and `File[T]` annotations validated to ensure directories reference other bundles and files do not contain nested directories."
-    - "`twig()` helper captures optional `name`, `prefix`, and `extension` metadata for fields."
-    - "Naming hints (literal, template, callable) drive directory and file naming."
-    - "Default file extensions inferred from type annotations (text, mappings, JSONL lists, etc.)."
-    - "Bundle instances store per-instance metadata via the `metadata` init keyword."
-    - "`write_bundle` renders bundle instances, creating directories for `Dir[...]` fields and serializing files (text, bytes, JSON, JSONL)."
+    - "`@bundle` converts a dataclass, resolves its layout, and attaches write/read/layout."
+    - "`at(pattern)` declares placement; omitting it defaults to field name plus codec extension."
+    - "An extension written into a pattern overrides the codec default."
+    - "`Dir[list[T]]` whose final pattern segment has no variable raises LayoutError on declaration."
+    - "Two fields resolving to one literal path raise LayoutError on declaration."
+    - "A pattern variable naming no field raises SpecError on declaration."
+    - "A pattern value containing a path separator raises PatternError, blocking traversal."
+    - "Payloads are validated against their declared annotation before writing."
+    - "`File[Path]` copies an existing file; a missing source is an error, not a warning."
+    - "`scaffold_from_directory` emits editable Python source, collapsing repeated sibling shapes."
   non_functional:
-    - "Python 3.11+, type-hint heavy, dataclass-first design."
-    - "No non-stdlib dependencies in base package."
-    - "Deterministic field ordering based on dataclass definition order."
-  assumptions:
-    - "Most users serialize JSON/YAML or bytes; custom serializers optional."
-    - "Bundle schemas are authored in Python via dataclasses."
+    - "Python 3.11+, type-hint heavy, dataclass-first."
+    - "No non-stdlib dependencies in the base package."
+    - "Deterministic field and read ordering."
+    - "Bundles declared inside functions resolve sibling references (caller scope is captured)."
   risks:
-    - "Metadata naming callables may be mis-specified leading to runtime errors."
-    - "Extension inference may not match user expectations for complex types."
-    - "Users may expect validation/inference capabilities that are not yet shipped."
-
-mvp:
-  must_have:
-    - "`Dir` and `File` marker types plus the `@bundle` decorator."
-    - "`BundleDefinition`, `BundleField`, `BundleMetadata`, and `FieldKind` for introspection."
-    - "Metadata normalization via `twig()` with support for naming hints and extensions."
-    - "Extension inference from type annotations."
-    - "`write_bundle` function and injected `.write()` method for rendering bundles to disk."
-    - "Serialization support for str, bytes, JSON, and JSONL payloads."
-  nice_to_have:
-    - "Validation of directory structures before writing."
-    - "Pluggable serializer registry for additional formats."
-    - "Runtime metadata hooks that influence naming or serialization."
-  future:
-    - "Schema inference from existing directory trees."
-    - "CLI for infer/validate/render workflows."
-    - "FSSPEC backends (S3/GCS) and plugin serializers (Parquet/CSV/figures)."
-    - "Schema visualizations / HTML reports."
-
-domain:
-  entities:
-    - "`Dir[T]` and `File[T]`: marker types applied to dataclass fields."
-    - "`BundleDefinition`: captures bundle class structure."
-    - "`BundleField`: enriched dataclass field metadata."
-    - "`BundleMetadata`: normalized metadata per field/layer."
-    - "Naming hints (`HintKind` literal/template/callable)."
-  relationships:
-    - "BundleDefinition → sequence of BundleField entries."
-    - "BundleField metadata drives naming and serialization during writing."
-    - "Dir fields reference other bundle-decorated classes or iterables thereof."
-  data_shapes:
-    - >
-      BundleField = {
-        "name": "details",
-        "kind": "file" | "dir" | "value",
-        "annotation": typing information,
-        "metadata": [BundleMetadata, ...]
-      }
-    - >
-      BundleMetadata = {
-        "layer": Dir | File,
-        "index": 0,
-        "data": {"name": Hint, "extension": "json"}
-      }
-    - >
-      Python DSL example:
-        @bundle
-        class Report:
-            name: str
-            body: File[str] = twig(name="{name}")
-            details: File[dict]
-        report = Report(name="alpha", body="hello", details={"score": 10})
-        report.write("out/alpha")
+    - "Multi-variable segments rely on regex backtracking; adjacent variables with no separator are ambiguous."
+    - "Codec coverage is deliberately small; unusual payloads fall back to JSON."
+    - "Scaffolding infers from one example tree and may need hand-editing."
 
 interfaces:
   public_api:
-    - "`Dir`"
-    - "`File`"
-    - "`bundle` decorator"
-    - "`twig` helper"
-    - "`BundleDefinition`"
-    - "`BundleField`"
-    - "`BundleMetadata`"
-    - "`FieldKind`"
-    - "`Hint`"
-    - "`HintKind`"
-    - "`write_bundle`"
-    - "`RenderError`"
-  cli: []
-  behavior_flows:
-    - "Author dataclass with `Dir`/`File` annotations → decorate with `@bundle` → instantiate bundle."
-    - "Call instance `.write(path)` (or `write_bundle(instance, path)`) → writer walks bundle definition → creates directories/files with metadata-aware names."
+    - "bundle, at, File, Dir"
+    - "write_bundle, read_bundle, plan_bundle"
+    - "bundle_schema, is_bundle, BundleSchema, BundleField, FieldKind, PathSpec"
+    - "PathPattern, Codec, codec_for_annotation"
+    - "scaffold_from_directory"
+  instance_api:
+    - "instance.write(path, overwrite=False) -> Path"
+    - "Cls.read(path, strict=False) -> instance"
+    - "Cls.layout() -> str"
   errors:
-    - "BundleError"
-    - "InvalidBundleAnnotation"
-    - "BundleMetadataError"
-    - "RenderError (naming, overwrite, or serialization issues)"
+    - "PyartyError (base)"
+    - "PatternError (malformed pattern or value)"
+    - "SpecError (bad declaration); LayoutError (non-round-trippable layout)"
+    - "PayloadTypeError (value contradicts annotation, on write)"
+    - "WriteError / ReadError; MissingFileError (required field absent)"
 
 architecture:
-  style: "modular, schema-first, plugin-extensible serializers"
+  style: "layered, schema-first, dependency-free"
   components:
-    - "dsl: Dir[T], File[T], @bundle, twig, metadata normalization"
-    - "writer: write_bundle, naming, payload serialization"
-    - "package facade: pyarty/__init__.py"
-    - "tests: pytest coverage for DSL metadata and writer behavior"
+    - "pattern: PathPattern — format, match, glob, introspection"
+    - "codecs: annotation -> Codec (extension, encode, decode, accepts)"
+    - "schema: File/Dir/at/@bundle, resolution and declaration-time validation"
+    - "writer: plan then execute; strict payload validation"
+    - "reader: schema-driven discovery; lenient by default"
+    - "scaffold: directory -> editable bundle source"
+    - "errors: one hierarchy, messages naming field/type/path"
   flow:
-    - "User defines bundle class → instantiate → call `.write()` to materialize output."
+    - "Declare bundle -> @bundle resolves and validates layout -> instantiate."
+    - "write: plan every file -> validate payloads -> execute."
+    - "read: per field, glob then match -> decode by annotation -> fill values from captures."
 
 technology:
   language: "Python 3.11+"
-  libraries:
-    - "Standard library only"
-  storage:
-    - "Local filesystem (MVP)"
+  libraries: ["Standard library only"]
+  storage: ["Local filesystem"]
   deployment_target: "Local, CI, Docker environments"
-
-security:
-  sensitive_data:
-    - "None inherent—depends on user-provided data."
-  auth: "None; filesystem only."
-  privacy_notes: "Users responsible for not writing sensitive data."
 
 development:
   testing:
-    - "Unit tests for DSL annotation/metadata handling."
-    - "Writer integration tests using pytest tmp_path fixtures."
+    - "test_pattern: format/match are exact inverses; malformed patterns rejected."
+    - "test_roundtrip: full write/read cycles per layout and per codec; byte identity."
+    - "test_schema: declaration-time validation and error message content."
+    - "test_writer: strict payload validation, atomicity, overwrite, collections, copy."
+    - "test_reader: leniency, strict mode, optionals, ambiguity, error messages."
+    - "test_scaffold: generated source compiles, reads its own tree, inverts write."
   folder_structure:
-    - "pyarty/dsl.py"
-    - "pyarty/writer.py"
-    - "pyarty/__init__.py"
+    - "pyarty/{pattern,codecs,schema,writer,reader,scaffold,errors}.py"
     - "tests/"
   conventions:
-    - "PEP8, type hints, dataclasses."
-    - "Predictable ordering of children in specs."
-    - "Pathlib everywhere."
+    - "PEP8, type hints, dataclasses, pathlib everywhere."
+    - "Patterns are always relative and '/'-separated on every platform."
+    - "Errors name the field, the declared type, and the path."
     - "use pytest"
 
-operations:
-  logging:
-    - "Currently none (no logging hooks)."
-  metrics:
-    - "files_written (future)"
-    - "naming_overrides (future)"
-  deployment: "PyPI + GitHub Actions"
-  runbook_notes:
-    - "Author Python bundles, instantiate with runtime values, call `.write(path)` to emit outputs."
-    - "Use pytest to validate bundle behavior during development."
-    - "Add inference/validation steps once those modules land."
+future:
+  - "CLI for scaffold/validate/render workflows."
+  - "Pluggable codec registry (Parquet/CSV/images)."
+  - "fsspec backends (S3/GCS)."
+  - "JSON Schema export for documentation and agent consumption."
+  - "Glob-free indexed reads for very large trees."

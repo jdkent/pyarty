@@ -1,293 +1,255 @@
+"""Writing bundles to disk.
+
+Writing is *strict*: the whole tree is planned and validated in memory before
+a single byte is written. A bundle therefore either produces a complete, valid
+directory or raises without leaving a half-written one behind.
+"""
+
 from __future__ import annotations
 
-import inspect
-import json
 import shutil
-import warnings
-from os import PathLike
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Type
+from typing import Any, Iterable
 
-from .dsl import (
-    BundleDefinition,
-    BundleField,
-    BundleMetadata,
-    FieldKind,
-    File,
-    Dir,
-    Hint,
-    HintKind,
-)
+from .codecs import describe_annotation
+from .errors import PayloadTypeError, WriteError
+from .schema import BundleField, FieldKind, bundle_schema, is_bundle
+
+__all__ = ["write_bundle", "plan_bundle"]
 
 
-class RenderError(RuntimeError):
-    """Raised when a bundle cannot be rendered to disk."""
+@dataclass(frozen=True)
+class _PlannedFile:
+    """One resolved file write, ready to execute."""
+
+    relative_path: str
+    payload: bytes | None
+    copy_from: Path | None
+    #: Dotted field path, for error messages.
+    origin: str
 
 
 def write_bundle(
-    bundle: Any, output_path: str | Path, *, overwrite: bool = False
-) -> None:
-    """Render a bundle instance to ``output_path``."""
+    instance: Any, path: str | Path, *, overwrite: bool = False
+) -> Path:
+    """Write ``instance`` into directory ``path``.
 
-    path = Path(output_path)
-    if path.exists():
-        if not overwrite and any(path.iterdir()):
-            raise RenderError(f"Destination '{path}' already exists and is not empty.")
-    else:
-        path.mkdir(parents=True, exist_ok=True)
+    Returns the directory written. Raises before touching disk if any payload
+    contradicts its declared annotation.
+    """
+    base = Path(path)
+    planned = plan_bundle(instance)
 
-    definition = getattr(bundle.__class__, "__bundle_definition__", None)
-    if definition is None or not isinstance(definition, BundleDefinition):
-        raise RenderError("Object is not a bundle-decorated dataclass instance.")
-
-    _render_fields(definition, bundle, path)
-
-
-def _render_fields(
-    definition: BundleDefinition, instance: Any, base_path: Path
-) -> None:
-    for field in definition.fields:
-        value = getattr(instance, field.name)
-        if value is None:
-            continue
-        if field.kind is FieldKind.DIR:
-            _render_dir_field(field, value, instance, base_path)
-        elif field.kind is FieldKind.FILE:
-            _render_file_field(field, value, instance, base_path)
-        # VALUE fields are metadata-only and skipped.
-
-
-def _render_dir_field(
-    field: BundleField, value: Any, owner: Any, base_path: Path
-) -> None:
-    entries = _iter_dir_entries(value)
-    if not entries:
-        return
-
-    for index, child in entries:
-        name = _compute_name(field, owner, child, index)
-        dir_path = base_path / name
-        dir_path.mkdir(parents=True, exist_ok=True)
-        child_def = getattr(child.__class__, "__bundle_definition__", None)
-        if child_def is None:
-            raise RenderError(
-                f"Directory field '{field.name}' expected bundle data; got {type(child).__name__}."
+    if base.exists():
+        if not base.is_dir():
+            raise WriteError(f"Destination '{base}' exists and is not a directory.")
+        clashes = [p for p in planned if (base / p.relative_path).exists()]
+        if clashes and not overwrite:
+            listed = ", ".join(sorted(p.relative_path for p in clashes)[:5])
+            raise WriteError(
+                f"Destination '{base}' already contains {len(clashes)} of the "
+                f"files to be written ({listed}"
+                f"{', ...' if len(clashes) > 5 else ''}). "
+                "Pass overwrite=True to replace them."
             )
-        _render_fields(child_def, child, dir_path)
 
-
-def _render_file_field(
-    field: BundleField, value: Any, owner: Any, base_path: Path
-) -> None:
-    metadata = _metadata_for_layer(field.metadata, layer_type=File)
-    extension = metadata.get("extension")
-    explicit_extension = "extension" in field.raw_metadata
-    copyfile_flag = bool(metadata.get("copyfile"))
-    name = _compute_name(field, owner, value, None)
-    if not name:
-        raise RenderError(f"File field '{field.name}' produced an empty name.")
-    filename = name
-    source_path: Path | None = None
-    if copyfile_flag:
-        source_path = _pathlike_or_none(value)
-        inferred_ext = _infer_extension_from_source(source_path)
-        if inferred_ext and not explicit_extension:
-            extension = inferred_ext
-    if extension:
-        filename = f"{filename}.{extension}"
-    target = base_path / filename
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if copyfile_flag and _copy_file_payload(source_path, target):
-        return
-    _write_payload(target, value, extension)
-
-
-def _iter_dir_entries(value: Any) -> list[tuple[int | None, Any]]:
-    if value is None:
-        return []
-    if isinstance(value, Iterable) and not isinstance(value, (str, bytes, bytearray)):
-        entries: list[tuple[int | None, Any]] = []
-        for idx, item in enumerate(value):
-            entries.append((idx, item))
-        return entries
-    return [(None, value)]
-
-
-def _metadata_for_layer(
-    metadata: tuple[BundleMetadata, ...], layer_type: Type[Any]
-) -> Mapping[str, Any]:
-    for entry in metadata:
-        if entry.layer is layer_type:
-            return entry.data
-    return {}
-
-
-def _compute_name(
-    field: BundleField, owner: Any, subject: Any, index: int | None
-) -> str:
-    layer = Dir if field.kind is FieldKind.DIR else File
-    metadata = _metadata_for_layer(field.metadata, layer)
-    name_hint = metadata.get("name")
-    name = _resolve_hint(name_hint, owner, subject, index, field.name)
-    if name is None:
-        if field.kind is FieldKind.DIR and field.is_collection and index is not None:
-            name = field.name
+    for item in planned:
+        target = base / item.relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if item.copy_from is not None:
+            shutil.copy2(item.copy_from, target)
         else:
-            name = _default_name(field.name, index)
-    prefix_hint = metadata.get("prefix")
-    if prefix_hint:
-        prefix_value = _resolve_hint(prefix_hint, owner, subject, index, field.name)
-        if prefix_value:
-            return _apply_prefix(prefix_value, name)
-    return name
+            assert item.payload is not None  # guaranteed by _plan_file
+            target.write_bytes(item.payload)
+
+    # Directories that contain no files still belong to the declared layout.
+    base.mkdir(parents=True, exist_ok=True)
+    for directory in _planned_directories(instance):
+        (base / directory).mkdir(parents=True, exist_ok=True)
+
+    return base
 
 
-def _resolve_hint(
-    hint: Hint | None,
+def plan_bundle(instance: Any) -> tuple[_PlannedFile, ...]:
+    """Resolve ``instance`` into the exact files it would write.
+
+    Exposed so callers can preview or test a layout without writing it.
+    """
+    if not is_bundle(type(instance)):
+        raise WriteError(
+            f"{type(instance).__name__} is not a @bundle class instance."
+        )
+    planned: list[_PlannedFile] = []
+    _plan(instance, prefix="", origin=type(instance).__name__, into=planned)
+    _reject_duplicates(planned)
+    return tuple(planned)
+
+
+def _reject_duplicates(planned: Iterable[_PlannedFile]) -> None:
+    seen: dict[str, str] = {}
+    for item in planned:
+        previous = seen.get(item.relative_path)
+        if previous is not None:
+            raise WriteError(
+                f"Two fields would both write '{item.relative_path}': "
+                f"{previous} and {item.origin}. This usually means a pattern "
+                "variable holds the same value for two elements."
+            )
+        seen[item.relative_path] = item.origin
+
+
+def _plan(
+    instance: Any, *, prefix: str, origin: str, into: list[_PlannedFile]
+) -> None:
+    schema = bundle_schema(type(instance))
+    for item in schema.fields:
+        value = getattr(instance, item.name, None)
+        where = f"{origin}.{item.name}"
+
+        if item.kind is FieldKind.VALUE:
+            continue
+        if value is None:
+            if item.optional or item.has_default:
+                continue
+            raise PayloadTypeError(
+                f"Field '{where}' is None but is not optional. Declare it as "
+                f"'{describe_annotation(item.annotation)} | None' to allow "
+                "omitting it."
+            )
+
+        if item.kind is FieldKind.FILE:
+            into.append(_plan_file(item, value, instance, prefix, where))
+        else:
+            _plan_dir(item, value, instance, prefix, where, into)
+
+
+def _plan_file(
+    item: BundleField,
+    value: Any,
     owner: Any,
-    subject: Any,
-    index: int | None,
-    field_name: str,
-) -> str | None:
-    if hint is None:
-        return None
-    context = owner if hint.source == "self" else subject
-    if hint.kind is HintKind.LITERAL:
-        return str(hint.value)
-    if hint.kind is HintKind.TEMPLATE:
-        context_mapping = dict(_context_from(context))
-        if index is not None:
-            context_mapping.setdefault("index", index)
-        try:
-            return hint.value.format(**context_mapping)
-        except KeyError as exc:
-            raise RenderError(
-                f"Missing template variable {exc.args[0]!r} for field '{field_name}'."
-            ) from exc
-    if hint.kind is HintKind.CALLABLE:
-        return _invoke_hint_callable(hint.value, context, index)
-    raise RenderError(f"Unsupported hint kind for field '{field_name}'.")
+    prefix: str,
+    where: str,
+) -> _PlannedFile:
+    assert item.pattern is not None and item.codec is not None
 
+    if item.is_copy:
+        source = _resolve_source(value, where)
+        pattern = item.pattern
+        if not pattern.suffix and source.suffix:
+            # Preserve the source extension so read() can find it again.
+            pattern = pattern.with_suffix(source.suffix)
+        relative = _join(prefix, pattern.format(_variables(owner)))
+        return _PlannedFile(
+            relative_path=relative, payload=None, copy_from=source, origin=where
+        )
 
-def _context_from(source: Any) -> Mapping[str, Any]:
-    if source is None:
-        return {}
-    if isinstance(source, Mapping):
-        return source
-    if hasattr(source, "__dict__"):
-        return vars(source)
-    return {}
+    if not item.codec.accepts(value):
+        raise PayloadTypeError(
+            f"Field '{where}' is declared "
+            f"File[{describe_annotation(item.payload)}], which expects "
+            f"{item.codec.expects}, but got {type(value).__name__}: "
+            f"{_preview(value)}"
+        )
 
-
-def _default_name(field_name: str, index: int | None) -> str:
-    if index is None:
-        return field_name
-    return f"{field_name}_{index}"
-
-
-def _apply_prefix(prefix: str, name: str) -> str:
-    return str(Path(prefix) / name)
-
-
-def _invoke_hint_callable(
-    func: Callable[..., Any], context: Any, index: int | None
-) -> str:
     try:
-        sig = inspect.signature(func)
-    except (TypeError, ValueError):
-        return str(func(context) if index is None else func(context, index))
+        payload = item.codec.encode(value)
+    except (TypeError, ValueError) as exc:
+        raise PayloadTypeError(
+            f"Field '{where}' could not be encoded as {item.codec.name}: {exc}"
+        ) from exc
 
-    params = [
-        p
-        for p in sig.parameters.values()
-        if p.kind
-        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    has_varargs = any(
-        p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
-    )
-    args: list[Any] = []
-    if not params and not has_varargs:
-        return str(func())
-    if params:
-        args.append(context)
-    if index is not None and (has_varargs or len(args) < len(params)):
-        args.append(index)
-    return str(func(*args))
-
-
-def _write_payload(target: Path, payload: Any, extension: str | None) -> None:
-    if isinstance(payload, bytes):
-        target.write_bytes(payload)
-        return
-    if isinstance(payload, str):
-        target.write_text(payload)
-        return
-    if extension == "json":
-        with target.open("w", encoding="utf-8") as fp:
-            json.dump(payload, fp, indent=2, ensure_ascii=False)
-        return
-    if extension == "jsonl":
-        if not isinstance(payload, Iterable) or isinstance(
-            payload, (str, bytes, bytearray)
-        ):
-            raise RenderError("jsonl payload must be an iterable of records.")
-        with target.open("w", encoding="utf-8") as fp:
-            for row in payload:
-                fp.write(json.dumps(row, ensure_ascii=False))
-                fp.write("\n")
-        return
-    if hasattr(payload, "read"):
-        target.write_bytes(payload.read())
-        return
-    raise RenderError(
-        f"Unsupported payload type for field output: {type(payload).__name__}."
+    relative = _join(prefix, item.pattern.format(_variables(owner)))
+    return _PlannedFile(
+        relative_path=relative, payload=payload, copy_from=None, origin=where
     )
 
 
-def _copy_file_payload(source_path: Path | None, target: Path) -> bool:
-    if source_path is None:
-        warnings.warn(
-            "copyfile metadata requires a string or path-like payload; falling back to default serialization.",
-            RuntimeWarning,
-        )
-        return False
-    if not source_path.exists():
-        warnings.warn(
-            f"copyfile source '{source_path}' does not exist; falling back to default serialization.",
-            RuntimeWarning,
-        )
-        return False
-    if source_path.is_dir():
-        warnings.warn(
-            f"copyfile source '{source_path}' is a directory; falling back to default serialization.",
-            RuntimeWarning,
-        )
-        return False
-    try:
-        shutil.copy2(source_path, target)
-    except OSError as exc:
-        warnings.warn(
-            f"copyfile unable to copy '{source_path}' -> '{target}': {exc}; falling back to default serialization.",
-            RuntimeWarning,
-        )
-        return False
-    return True
+def _plan_dir(
+    item: BundleField,
+    value: Any,
+    owner: Any,
+    prefix: str,
+    where: str,
+    into: list[_PlannedFile],
+) -> None:
+    assert item.pattern is not None
+    children = list(value) if item.is_collection else [value]
+
+    for index, child in enumerate(children):
+        if not is_bundle(type(child)):
+            raise PayloadTypeError(
+                f"Field '{where}' is declared Dir[...] of "
+                f"'{item.child.__name__}' but element {index} is a "  # type: ignore[union-attr]
+                f"{type(child).__name__}."
+            )
+        # Child values win; the owner supplies anything the child lacks.
+        scope = {**_variables(owner), **_variables(child)}
+        relative = _join(prefix, item.pattern.format(scope))
+        child_origin = f"{where}[{index}]" if item.is_collection else where
+        _plan(child, prefix=relative, origin=child_origin, into=into)
 
 
-def _pathlike_or_none(value: Any) -> Path | None:
-    if isinstance(value, Path):
-        return value
-    if isinstance(value, (str, PathLike)):
-        return Path(value)
-    return None
+def _planned_directories(instance: Any) -> list[str]:
+    """Relative directories implied by ``Dir`` fields, including empty ones."""
+    found: list[str] = []
+
+    def walk(current: Any, prefix: str) -> None:
+        schema = bundle_schema(type(current))
+        for item in schema.by_kind(FieldKind.DIR):
+            value = getattr(current, item.name, None)
+            if value is None:
+                continue
+            assert item.pattern is not None
+            children = list(value) if item.is_collection else [value]
+            for child in children:
+                if not is_bundle(type(child)):
+                    continue
+                scope = {**_variables(current), **_variables(child)}
+                relative = _join(prefix, item.pattern.format(scope))
+                found.append(relative)
+                walk(child, relative)
+
+    walk(instance, "")
+    return found
 
 
-def _infer_extension_from_source(source_path: Path | None) -> str | None:
-    if source_path is None:
-        return None
-    suffix = source_path.suffix
-    if not suffix:
-        return None
-    normalized = suffix.lstrip(".")
-    return normalized or None
+def _variables(instance: Any) -> dict[str, Any]:
+    """Values on ``instance`` usable as pattern variables.
+
+    Only plain values qualify; a ``File``/``Dir`` field holds a payload, not a
+    name, so including it would let a dict leak into a path.
+    """
+    schema = bundle_schema(type(instance))
+    return {
+        item.name: getattr(instance, item.name, None)
+        for item in schema.by_kind(FieldKind.VALUE)
+    }
+
+
+def _resolve_source(value: Any, where: str) -> Path:
+    if not isinstance(value, (str, Path)):
+        raise PayloadTypeError(
+            f"Field '{where}' is a copy field, so it expects a path; got "
+            f"{type(value).__name__}."
+        )
+    source = Path(value).expanduser()
+    if not source.exists():
+        raise WriteError(
+            f"Field '{where}' copies from '{source}', which does not exist."
+        )
+    if source.is_dir():
+        raise WriteError(
+            f"Field '{where}' copies from '{source}', which is a directory; "
+            "use Dir[...] for directory structure."
+        )
+    return source
+
+
+def _join(prefix: str, relative: str) -> str:
+    return f"{prefix}/{relative}" if prefix else relative
+
+
+def _preview(value: Any, limit: int = 60) -> str:
+    text = repr(value)
+    return text if len(text) <= limit else f"{text[:limit]}..."
