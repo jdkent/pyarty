@@ -1,6 +1,6 @@
 """The declaration layer: ``File``, ``Dir``, ``at()`` and ``@bundle``.
 
-A bundle is an ordinary dataclass whose fields fall into exactly four kinds:
+A bundle is an ordinary dataclass whose fields fall into exactly five kinds:
 
 ``File[T]``
     A single file. ``T`` selects the codec (see :mod:`pyarty.codecs`).
@@ -8,6 +8,8 @@ A bundle is an ordinary dataclass whose fields fall into exactly four kinds:
     Many files sharing one pattern, keyed by one of its variables.
 ``Dir[T]`` / ``Dir[list[T]]``
     A subdirectory (or one per element) described by another bundle class.
+``Group[list[T]]``
+    Records assembled across parallel trees, sharing one key variable.
 ``T`` (anything else)
     A plain value. It is *never* written as its own file; it is carried by the
     pattern variables of its siblings, which is how a name baked into a path
@@ -46,6 +48,7 @@ __all__ = [
     "Dir",
     "File",
     "Files",
+    "Group",
     "at",
     "bundle",
     "is_bundle",
@@ -98,10 +101,41 @@ class Dir(Generic[_T]):
     """
 
 
+class Group(Generic[_T]):
+    """Marks a field as records assembled across *parallel* trees.
+
+    Declared as ``Group[list[Record]]`` with ``at(key="...")``. Where ``Dir``
+    repeats a bundle over subdirectories — each child rooted in its own
+    directory — ``Group`` repeats one over the distinct values of a shared key,
+    with every child rooted in the *same* directory as its parent. The child's
+    patterns are therefore full relative paths that happen to agree on one
+    variable:
+
+        @bundle
+        class Sample:
+            stem: str
+            image: File[bytes] = at("images/train/{stem}.jpg")
+            label: File[str]   = at("labels/train/{stem}.txt")
+
+        @bundle
+        class Dataset:
+            samples: Group[list[Sample]] = at(key="stem")
+
+    That is the shape of a YOLO detection set, a BIDS image beside its sidecar,
+    or any "two directories zipped by filename" layout, none of which can be
+    expressed by nesting, because no single directory contains one record.
+
+    Keys are discovered as the union over the child's patterns, so a record
+    missing one of its files surfaces through that field's own rules — an error
+    if required, ``None`` if optional — rather than being dropped silently.
+    """
+
+
 class FieldKind(str, Enum):
     FILE = "file"
     FILES = "files"
     DIR = "dir"
+    GROUP = "group"
     VALUE = "value"
 
 
@@ -224,6 +258,16 @@ class BundleSchema:
                 lines.append(
                     f"  {item.pattern}  [{detail}, many keyed by {{{item.key}}}]"
                 )
+            elif item.kind is FieldKind.GROUP:
+                child = item.child
+                where = f"{item.pattern}/" if item.pattern else "."
+                lines.append(
+                    f"  {where}  [{child.__name__} records, "  # type: ignore[union-attr]
+                    f"grouped by {{{item.key}}}]"
+                )
+                if child not in seen:
+                    for line in bundle_schema(child)._describe_lines(seen)[1:]:  # type: ignore[arg-type]
+                        lines.append(f"  {line}")
             else:
                 marker = "*" if item.is_collection else ""
                 child = item.child
@@ -399,6 +443,8 @@ def _resolve_field(
         return _resolve_files(cls, dc_field, annotation, base, spec, optional, has_default)
     if origin is Dir:
         return _resolve_dir(cls, dc_field, annotation, base, spec, optional, has_default)
+    if origin is Group:
+        return _resolve_group(cls, dc_field, annotation, base, spec, optional, has_default)
 
     if spec is not None:
         raise SpecError(
@@ -617,6 +663,99 @@ def _resolve_dir(
     )
 
 
+def _resolve_group(
+    cls: type[Any],
+    dc_field: DataclassField[Any],
+    annotation: Any,
+    base: Any,
+    spec: PathSpec | None,
+    optional: bool,
+    has_default: bool,
+) -> BundleField:
+    args = get_args(base)
+    if len(args) != 1:
+        raise SpecError(
+            f"Group[...] on field '{dc_field.name}' of '{cls.__name__}' needs "
+            "exactly one argument, e.g. Group[list[Record]]."
+        )
+
+    child, is_collection = _child_of(args[0])
+    if child is None or not is_collection:
+        raise SpecError(
+            f"Group[...] on field '{dc_field.name}' of '{cls.__name__}' must be "
+            f"a list of a @bundle class, e.g. Group[list[Record]]; got "
+            f"'{describe_annotation(args[0])}'."
+        )
+
+    key = spec.key if spec else None
+    if not key:
+        raise SpecError(
+            f"Group field '{dc_field.name}' on '{cls.__name__}' needs the "
+            f"variable its records share.\n"
+            f"  Try: at(key=\"...\") — a field on '{child.__name__}' that "
+            "appears in its patterns."
+        )
+
+    child_names = _field_names_of(child)
+    if key not in child_names:
+        raise SpecError(
+            f"Group field '{dc_field.name}' on '{cls.__name__}' groups by "
+            f"'{key}', which is not a field on '{child.__name__}'. It has: "
+            f"{', '.join(sorted(child_names)) or '(no fields)'}."
+        )
+
+    # The key must appear in at least one of the child's patterns, or there is
+    # nothing on disk to discover records from.
+    child_schema = getattr(child, SCHEMA_ATTR, None)
+    if child_schema is not None:
+        carriers = [
+            item.name
+            for item in child_schema.fields
+            if item.pattern is not None and key in item.pattern.variables
+        ]
+        if not carriers:
+            raise SpecError(
+                f"Group field '{dc_field.name}' on '{cls.__name__}' groups by "
+                f"'{key}', but no pattern on '{child.__name__}' contains "
+                f"'{{{key}}}', so records cannot be discovered.\n"
+                f"  Reference it — e.g. at(\"dir/{{{key}}}.txt\") — on at "
+                f"least one of its File/Files/Dir fields."
+            )
+
+    # A pattern is optional here and acts purely as a prefix directory; the
+    # records are named by their own patterns, not by this one.
+    pattern = (
+        PathPattern.parse(spec.pattern, charset=spec.charset)
+        if spec is not None and spec.pattern is not None
+        else None
+    )
+    if pattern is not None and pattern.is_dynamic:
+        # A variable here could not be recovered: the prefix is the only thing
+        # that would capture it, so reading has nothing to match against. That
+        # shape is a directory per value, which is what Dir already expresses.
+        raise SpecError(
+            f"Group field '{dc_field.name}' on '{cls.__name__}' has prefix "
+            f"'{pattern}', which contains a variable. A group prefix must be a "
+            f"fixed path, because nothing else would capture it on read.\n"
+            f"  For one group per directory, nest it: put the Group on a child "
+            f"bundle and reach it with Dir[list[Child]] = at(\"{pattern}\")."
+        )
+    return BundleField(
+        name=dc_field.name,
+        kind=FieldKind.GROUP,
+        annotation=annotation,
+        payload=args[0],
+        pattern=pattern,
+        codec=None,
+        child=child,
+        is_collection=True,
+        optional=optional,
+        has_default=has_default,
+        is_copy=False,
+        key=key,
+    )
+
+
 def _pattern_for(spec: PathSpec | None, field_name: str) -> PathPattern:
     charset = spec.charset if spec is not None else None
     raw = spec.pattern if spec is not None and spec.pattern is not None else field_name
@@ -709,6 +848,16 @@ def _validate_variables(schema: BundleSchema) -> None:
                 f"'{item.child.__name__}' has: "  # type: ignore[union-attr]
                 f"{', '.join(sorted(child_names)) or '(no fields)'}"
             )
+        elif item.kind is FieldKind.GROUP:
+            # Any prefix pattern resolves against the owner; the key belongs to
+            # the records and is validated in _resolve_group.
+            resolvable = own_names
+            hint = f"'{cls_name}' has: {', '.join(sorted(own_names))}"
+        elif item.kind is FieldKind.GROUP:
+            # Any prefix pattern resolves against the owner; the grouping key
+            # belongs to the records and is validated in _resolve_group.
+            resolvable = own_names
+            hint = f"'{cls_name}' has: {', '.join(sorted(own_names))}"
         elif item.kind is FieldKind.FILES:
             # The key variable comes from the mapping key, not from a field;
             # every other variable still has to resolve against the owner.

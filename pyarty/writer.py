@@ -123,6 +123,8 @@ def _plan(
             into.append(_plan_file(item, value, instance, prefix, where))
         elif item.kind is FieldKind.FILES:
             _plan_files(item, value, instance, prefix, where, into)
+        elif item.kind is FieldKind.GROUP:
+            _plan_group(item, value, instance, prefix, where, into)
         else:
             _plan_dir(item, value, instance, prefix, where, into)
 
@@ -207,6 +209,57 @@ def _plan_files(
         )
 
 
+def _plan_group(
+    item: BundleField,
+    value: Any,
+    owner: Any,
+    prefix: str,
+    where: str,
+    into: list[_PlannedFile],
+) -> None:
+    """Plan a ``Group``: records rooted in the *owner's* directory.
+
+    Unlike ``Dir``, a group creates no directory of its own — each record's
+    fields carry full relative paths that spread across parallel trees. So the
+    records are planned at the same prefix as their owner, and any pattern on
+    the group field acts purely as a prefix directory.
+    """
+    if isinstance(value, abc.Mapping) or not isinstance(value, abc.Iterable):
+        raise PayloadTypeError(
+            f"Field '{where}' is declared Group[list[...]] and expects a "
+            f"sequence of '{item.child.__name__}'; got "  # type: ignore[union-attr]
+            f"{type(value).__name__}."
+        )
+
+    root = prefix
+    if item.pattern is not None:
+        root = _join(prefix, item.pattern.format(_variables(owner)))
+
+    seen_keys: dict[Any, int] = {}
+    for index, record in enumerate(value):
+        if not is_bundle(type(record)):
+            raise PayloadTypeError(
+                f"Field '{where}' is declared Group[list[...]] of "
+                f"'{item.child.__name__}' but element {index} is a "  # type: ignore[union-attr]
+                f"{type(record).__name__}."
+            )
+        key = getattr(record, item.key, None)  # type: ignore[arg-type]
+        if key is None:
+            raise PayloadTypeError(
+                f"Field '{where}' groups by '{item.key}', but element {index} "
+                f"has {item.key}=None. It names the record's files, so it "
+                "cannot be blank."
+            )
+        if key in seen_keys:
+            raise PayloadTypeError(
+                f"Field '{where}' has two records with {item.key}={key!r} "
+                f"(elements {seen_keys[key]} and {index}). The grouping key "
+                "must be unique, or their files would collide."
+            )
+        seen_keys[key] = index
+        _plan(record, prefix=root, origin=f"{where}[{key!r}]", into=into)
+
+
 def _plan_dir(
     item: BundleField,
     value: Any,
@@ -238,6 +291,19 @@ def _planned_directories(instance: Any) -> list[str]:
 
     def walk(current: Any, prefix: str) -> None:
         schema = bundle_schema(type(current))
+        # Group records live in their owner's directory, so any Dir fields they
+        # declare still contribute directories at that same prefix.
+        for item in schema.by_kind(FieldKind.GROUP):
+            records = getattr(current, item.name, None) or []
+            root = prefix
+            if item.pattern is not None:
+                root = _join(prefix, item.pattern.format(_variables(current)))
+            if item.pattern is not None:
+                found.append(root)
+            for record in records:
+                if is_bundle(type(record)):
+                    walk(record, root)
+
         for item in schema.by_kind(FieldKind.DIR):
             value = getattr(current, item.name, None)
             if value is None:

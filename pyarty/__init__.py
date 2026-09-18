@@ -46,6 +46,7 @@ from .schema import (
     FieldKind,
     File,
     Files,
+    Group,
     PathSpec,
     at,
     bundle,
@@ -63,6 +64,7 @@ __all__ = [
     "File",
     "Files",
     "Dir",
+    "Group",
     # Round trip
     "write_bundle",
     "read_bundle",

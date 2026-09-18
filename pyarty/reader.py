@@ -44,7 +44,7 @@ def read_bundle(
 
     claimed: set[Path] = set()
     instance = _read_into(
-        cls, base, inherited={}, claimed=claimed, strict=strict, depth=0
+        cls, base, inherited={}, claimed=claimed, strict=strict, depth=0, fixed={}
     )
 
     if strict:
@@ -65,12 +65,19 @@ def _read_into(
     claimed: set[Path],
     strict: bool,
     depth: int = 0,
+    fixed: Mapping[str, Any] = {},
 ) -> Any:
     """Build one instance of ``cls`` from directory ``base``.
 
     ``inherited`` carries pattern variables captured by an ancestor's ``Dir``
     pattern — this is how a name encoded in a directory name lands back in the
     child's own field.
+
+    ``fixed`` is the narrower set of variables an enclosing ``Group`` has
+    pinned. Those *constrain* which files a pattern may match, because every
+    field of one record must agree on the record's key. ``inherited`` cannot be
+    used for that: a ``Dir`` pattern rebinds its variable at each level, so a
+    recursive layout would filter away its own grandchildren.
     """
     if depth > MAX_DEPTH:
         raise ReadError(
@@ -84,19 +91,28 @@ def _read_into(
 
     # Files first: their patterns may capture variables that value fields need.
     for item in schema.by_kind(FieldKind.FILE):
-        value, found_vars = _read_file(item, base, cls, claimed)
+        value, found_vars = _read_file(item, base, cls, claimed, fixed)
         if value is not _ABSENT:
             kwargs[item.name] = value
             captured.update(found_vars)
 
     for item in schema.by_kind(FieldKind.FILES):
-        value, found_vars = _read_files(item, base, cls, claimed)
+        value, found_vars = _read_files(item, base, cls, claimed, fixed)
         if value is not _ABSENT:
             kwargs[item.name] = value
             captured.update(found_vars)
 
     for item in schema.by_kind(FieldKind.DIR):
-        value = _read_dir(item, base, cls, captured, claimed, strict, depth)
+        value = _read_dir(
+            item, base, cls, captured, claimed, strict, depth, fixed
+        )
+        if value is not _ABSENT:
+            kwargs[item.name] = value
+
+    for item in schema.by_kind(FieldKind.GROUP):
+        value = _read_group(
+            item, base, cls, captured, claimed, strict, depth, fixed
+        )
         if value is not _ABSENT:
             kwargs[item.name] = value
 
@@ -117,6 +133,19 @@ def _read_into(
         ) from exc
 
 
+def _agrees(found: Mapping[str, Any], bound: Mapping[str, Any]) -> bool:
+    """Whether captured variables match the values already known from context.
+
+    A variable fixed by an enclosing ``Dir`` or ``Group`` must constrain the
+    candidates a pattern will accept. Without this a record inside a group
+    would glob its whole parallel tree and match every sibling's file.
+    """
+    for name, value in found.items():
+        if name in bound and str(bound[name]) != str(value):
+            return False
+    return True
+
+
 class _Absent:
     """Marker distinguishing "no value" from a legitimate ``None``."""
 
@@ -135,6 +164,7 @@ def _read_file(
     base: Path,
     cls: type[Any],
     claimed: set[Path],
+    bound: Mapping[str, Any] = {},
 ) -> tuple[Any, dict[str, Any]]:
     assert item.pattern is not None and item.codec is not None
     pattern = item.pattern
@@ -156,7 +186,7 @@ def _read_file(
             matches.append((candidate, {}))
             continue
         found = match_pattern.match(relative)
-        if found is not None:
+        if found is not None and _agrees(found, bound):
             matches.append((candidate, found))
 
     if not matches:
@@ -197,6 +227,7 @@ def _read_files(
     base: Path,
     cls: type[Any],
     claimed: set[Path],
+    bound: Mapping[str, Any] = {},
 ) -> tuple[Any, dict[str, Any]]:
     """Read every file matching a ``Files`` pattern into a mapping.
 
@@ -221,6 +252,8 @@ def _read_files(
         relative = candidate.relative_to(base).as_posix()
         variables = item.pattern.match(relative)
         if variables is None or item.key not in variables:
+            continue
+        if not _agrees(variables, bound):
             continue
 
         for name, value in variables.items():
@@ -273,6 +306,7 @@ def _read_dir(
     claimed: set[Path],
     strict: bool,
     depth: int = 0,
+    bound: Mapping[str, Any] = {},
 ) -> Any:
     assert item.pattern is not None and item.child is not None
     pattern = item.pattern
@@ -284,7 +318,7 @@ def _read_dir(
             continue
         relative = candidate.relative_to(base).as_posix()
         found = pattern.match(relative)
-        if found is not None:
+        if found is not None and _agrees(found, bound):
             matches.append((candidate, found))
 
     if item.is_collection:
@@ -296,6 +330,7 @@ def _read_dir(
                 claimed=claimed,
                 strict=strict,
                 depth=depth + 1,
+                fixed=bound,
             )
             for directory, found in matches
         ]
@@ -325,7 +360,77 @@ def _read_dir(
         claimed=claimed,
         strict=strict,
         depth=depth + 1,
+        fixed=bound,
     )
+
+
+# ----------------------------------------------------------------------
+# Groups
+# ----------------------------------------------------------------------
+def _read_group(
+    item: BundleField,
+    base: Path,
+    cls: type[Any],
+    captured: Mapping[str, Any],
+    claimed: set[Path],
+    strict: bool,
+    depth: int,
+    fixed: Mapping[str, Any] = {},
+) -> Any:
+    """Assemble records that span parallel trees under one directory.
+
+    The records share a key variable, so discovery means collecting every value
+    that key takes across the child's patterns, then reading one record per
+    value — each rooted at ``base``, not in a subdirectory of its own.
+    """
+    assert item.child is not None and item.key
+    root = base
+    if item.pattern is not None:
+        # Validated static at declaration time, so no scope is needed.
+        root = base / item.pattern.format({})
+    if not root.is_dir():
+        return _ABSENT if item.has_default else []
+
+    keys = _discover_group_keys(item.child, root, item.key)
+    if not keys and item.has_default:
+        return _ABSENT
+
+    return [
+        _read_into(
+            item.child,
+            root,
+            inherited={**captured, item.key: key},
+            claimed=claimed,
+            strict=strict,
+            depth=depth + 1,
+            # Pin the key so every field of this record matches only its own
+            # files, rather than globbing the whole parallel tree.
+            fixed={**fixed, item.key: key},
+        )
+        for key in keys
+    ]
+
+
+def _discover_group_keys(child: type[Any], root: Path, key: str) -> list[str]:
+    """Every value ``key`` takes across the child's patterns, sorted.
+
+    The union rather than the intersection: a record missing one of its files
+    should surface through that field's own required/optional rules, not vanish.
+    """
+    found: set[str] = set()
+    for item in bundle_schema(child).fields:
+        if item.pattern is None or key not in item.pattern.variables:
+            continue
+        wants_dir = item.kind is FieldKind.DIR
+        for candidate in root.glob(item.pattern.glob()):
+            if candidate.is_dir() != wants_dir:
+                continue
+            variables = item.pattern.match(
+                candidate.relative_to(root).as_posix()
+            )
+            if variables is not None and key in variables:
+                found.add(variables[key])
+    return sorted(found)
 
 
 # ----------------------------------------------------------------------

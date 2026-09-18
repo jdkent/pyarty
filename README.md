@@ -75,6 +75,7 @@ That is the entire model. Every field is exactly one of:
 | `Files[dict[K, T]]` | **many** files sharing one pattern | mapping, keyed from the path |
 | `Dir[T]` | one subdirectory | nested bundle |
 | `Dir[list[T]]` | one subdirectory per element | nested bundles |
+| `Group[list[T]]` | one record **across parallel trees** | records, keyed from the path |
 | anything else | a plain value | **captured from the path** |
 
 A plain value is never written as its own file. It is carried by a
@@ -189,6 +190,63 @@ than an error, since a partly-filled directory is a normal state.
 Only the mapping form exists. A `Files[list[T]]` is rejected at declaration
 time, because a bare list of payloads cannot tell `write` what to name each
 file — it could not round-trip.
+
+## Records across parallel trees
+
+Some layouts spread one logical record over *sibling* trees that agree on a
+filename — a YOLO image and its label, a BIDS image and its sidecar. No single
+directory holds a record, so nesting cannot express it. `Group[list[T]]` repeats
+a bundle over the distinct values of a shared key, rooting every record in the
+*same* directory as its owner:
+
+```python
+@bundle
+class Sample:
+    stem: str
+    image: File[bytes] = at("images/train/{stem}.jpg")
+    label: File[str]   = at("labels/train/{stem}.txt")
+
+@bundle
+class Dataset:
+    names: File[dict] = at("data.json")
+    samples: Group[list[Sample]] = at(key="stem")
+```
+
+```
+out/
+├── data.json
+├── images/train/{img001.jpg, img002.jpg}
+└── labels/train/{img001.txt, img002.txt}
+```
+
+```python
+Dataset.read("./out").samples[0].image   # the .jpg
+Dataset.read("./out").samples[0].label   # its paired .txt
+```
+
+`key=` names the field the records share; it must appear in at least one of the
+record's patterns, or there would be nothing on disk to discover them from.
+Records come back ordered by key.
+
+Keys are the **union** across the record's patterns, not the intersection, so an
+image with no label surfaces through that field's own rules — an error if it is
+required, `None` if `Optional` — rather than disappearing. That is the whole
+point: a silently dropped half-record is the bug this feature exists to prevent.
+
+A `Group` creates no directory of its own. Its pattern, if given, is a fixed
+prefix; it may not contain a variable, because nothing else would capture it on
+read. For one group per directory, nest it instead:
+
+```python
+@bundle
+class Split:
+    split: str
+    pairs: Group[list[Sample]] = at(key="stem")
+
+@bundle
+class Dataset:
+    splits: Dir[list[Split]] = at("{split}")     # train/, val/
+```
 
 ## Recursive layouts
 

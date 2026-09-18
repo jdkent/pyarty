@@ -4,7 +4,7 @@ meta:
     A two-way contract between directory trees and Python dataclasses. Fields
     declare where they live with bidirectional relative path patterns, so a
     bundle can be written to disk and read back into the same class.
-  iteration: "v0.3-repetition-and-recursion"
+  iteration: "v0.4-parallel-records"
   updated: "2026-09-18"
 
 purpose:
@@ -43,6 +43,7 @@ design:
     - "Dir[T]: one subdirectory described by another bundle."
     - "Dir[list[T]]: one subdirectory per element; pattern must vary per child."
     - "Dir[list[Self]]: recursive trees; a bundle may contain itself."
+    - "Group[list[T]]: one record spread across parallel trees, sharing a key."
     - "Any other annotation: a plain value, captured from a pattern variable."
   pattern_syntax:
     - "{name}: a variable, rendered on write and parsed on read."
@@ -50,6 +51,26 @@ design:
     - "[...]: an optional group, dropped when its variables are all None."
     - "A repeated variable is a backreference; every occurrence must agree."
     - "Brackets wrapping no variable stay literal, so a[1].txt is a filename."
+  group_vs_dir: >
+    Dir repeats a bundle over subdirectories, each child rooted in its own
+    directory. Group repeats one over the distinct values of a shared key,
+    with every record rooted in the same directory as its owner, so a record's
+    patterns are full relative paths that agree on one variable. That is the
+    only way to express a layout where no single directory holds a record — a
+    YOLO image beside its label, a BIDS image beside its sidecar.
+
+    Keys are discovered as the union across the record's patterns rather than
+    the intersection, so a half-record surfaces through its own field's
+    required/optional rules instead of being dropped. A group prefix must be
+    static: a variable there could not be recovered on read, and "a directory
+    per value" is what Dir already means, so the two compose instead.
+  fixed_vs_inherited: >
+    A Group pins its key for the whole record, which must constrain which
+    files each of its fields may match, or every record would glob the entire
+    parallel tree. That constraint cannot use the general inherited scope: a
+    Dir pattern rebinds its variable at each level, so filtering on it would
+    make a recursive layout discard its own grandchildren. The reader
+    therefore tracks the narrower set of Group-fixed variables separately.
   why_mapping_only: >
     Files has no list form on purpose. A bare list of payloads cannot tell
     write what to name each file, so it could not round trip. The mapping key
@@ -84,6 +105,9 @@ constraints:
     - "`Files[...]` with a static pattern, a list container, or an ambiguous key raises SpecError on declaration."
     - "A `Files` non-key variable must agree across every matching filename."
     - "Recursive reads are bounded by MAX_DEPTH to survive symlink loops."
+    - "`Group[list[T]]` requires key=, a field on T referenced by one of its patterns."
+    - "A `Group` prefix pattern must be static; a dynamic one raises SpecError pointing at Dir."
+    - "A `Group` refuses duplicate or None keys on write, since they name the record's files."
     - "Two fields resolving to one literal path raise LayoutError on declaration."
     - "A pattern variable naming no field raises SpecError on declaration."
     - "A pattern value containing a path separator raises PatternError, blocking traversal."
@@ -102,7 +126,7 @@ constraints:
 
 interfaces:
   public_api:
-    - "bundle, at, File, Files, Dir"
+    - "bundle, at, File, Files, Dir, Group"
     - "write_bundle, read_bundle, plan_bundle"
     - "bundle_schema, is_bundle, BundleSchema, BundleField, FieldKind, PathSpec"
     - "PathPattern, Codec, codec_for_annotation"
@@ -149,6 +173,7 @@ development:
     - "test_scaffold: generated source compiles, reads its own tree, inverts write."
     - "test_files: Files against BagIt, HuggingFace shards, BIDS runs, YOLO."
     - "test_recursive: self-referential bundles, depth, recursion limit."
+    - "test_group: paired records for YOLO and BIDS, union discovery, composition with Dir."
   folder_structure:
     - "pyarty/{pattern,codecs,schema,writer,reader,scaffold,errors}.py"
     - "tests/"
@@ -159,7 +184,6 @@ development:
     - "use pytest"
 
 future:
-  - "Cross-tree grouping: one record spanning parallel trees (images/ + labels/)."
   - "CLI for scaffold/validate/render workflows."
   - "Pluggable codec registry (Parquet/CSV/images)."
   - "fsspec backends (S3/GCS)."
