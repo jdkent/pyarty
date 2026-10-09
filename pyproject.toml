@@ -9,7 +9,7 @@ description = "A two-way contract between directory trees and Python dataclasses
 readme = "README.md"
 authors = [{name = "pyarty contributors"}]
 requires-python = ">=3.11"
-keywords = ["filesystem", "schema", "dataclass", "serialization", "round-trip"]
+keywords = ["filesystem", "schema", "dataclass", "pydantic", "serialization", "round-trip"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -22,7 +22,8 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+pydantic = ["pydantic>=2"]
+test = ["pytest>=7", "pydantic>=2"]
 
 [project.urls]
 Homepage = "https://github.com/jdkent/pyarty"

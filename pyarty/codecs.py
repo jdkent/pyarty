@@ -18,21 +18,38 @@ Annotation                   Extension  On disk
 ``list[dict]``               ``.jsonl`` one JSON object per line
 ``list`` / ``tuple`` (other) ``.json``  indented JSON array
 ``Path``                     (source)   copied from the given path
+a pydantic model ``M``       ``.json``  ``M`` as indented JSON
+``list[M]``                  ``.jsonl`` one ``M`` per line
 ===========================  =========  ==============================
 
 An explicit extension in the pattern always wins over the default above; only
 the encode/decode behaviour comes from the annotation.
+
+Pydantic models are validated in both directions: a write refuses anything that
+is not an instance of the declared model, and a read parses the file with
+``model_validate_json``, so a file that breaks the model is a ``ReadError``
+rather than a dict that only fails later. pydantic is not a dependency: a model
+class can only be declared once pydantic is imported, so the check looks for it
+in ``sys.modules`` instead of importing it.
 """
 
 from __future__ import annotations
 
 import collections.abc as abc
 import json
+import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Union, get_args, get_origin
 
-__all__ = ["Codec", "codec_for_annotation", "unwrap_optional", "describe_annotation"]
+__all__ = [
+    "Codec",
+    "codec_for_annotation",
+    "describe_annotation",
+    "is_pydantic_model",
+    "unwrap_optional",
+]
 
 
 _MAPPING_ORIGINS = (dict, abc.Mapping, abc.MutableMapping)
@@ -212,6 +229,58 @@ COPY = Codec(
 
 
 # ----------------------------------------------------------------------
+# Pydantic models
+# ----------------------------------------------------------------------
+def is_pydantic_model(annotation: Any) -> bool:
+    """True when ``annotation`` is a pydantic v2 model class."""
+    pydantic = sys.modules.get("pydantic")
+    if pydantic is None or not isinstance(annotation, type):
+        return False
+    return issubclass(annotation, pydantic.BaseModel) and hasattr(
+        annotation, "model_validate_json"
+    )
+
+
+def _model_json(value: Any, indent: int | None) -> str:
+    # by_alias, because validation reads aliases: a model whose fields are
+    # aliased would otherwise not read back what it wrote.
+    return value.model_dump_json(indent=indent, by_alias=True)
+
+
+@lru_cache(maxsize=None)
+def model_codec(model: type) -> Codec:
+    """One indented JSON document holding an instance of ``model``."""
+    return Codec(
+        name=f"pydantic:{model.__name__}",
+        extension="json",
+        encode=lambda value: (_model_json(value, 2) + "\n").encode("utf-8"),
+        decode=lambda raw: model.model_validate_json(raw),
+        accepts=lambda value: isinstance(value, model),
+        expects=f"a {model.__name__}",
+    )
+
+
+@lru_cache(maxsize=None)
+def model_lines_codec(model: type) -> Codec:
+    """JSON Lines, one instance of ``model`` per line."""
+    return Codec(
+        name=f"pydantic-jsonl:{model.__name__}",
+        extension="jsonl",
+        encode=lambda rows: "".join(
+            _model_json(row, None) + "\n" for row in rows
+        ).encode("utf-8"),
+        decode=lambda raw: [
+            model.model_validate_json(line)
+            for line in raw.decode("utf-8").splitlines()
+            if line.strip()
+        ],
+        accepts=lambda value: isinstance(value, (list, tuple))
+        and all(isinstance(row, model) for row in value),
+        expects=f"a list of {model.__name__}",
+    )
+
+
+# ----------------------------------------------------------------------
 # Annotation resolution
 # ----------------------------------------------------------------------
 def unwrap_optional(annotation: Any) -> tuple[Any, bool]:
@@ -247,6 +316,8 @@ def codec_for_annotation(annotation: Any) -> Codec:
         return FLOAT
     if inner is dict:
         return JSON_OBJECT
+    if is_pydantic_model(inner):
+        return model_codec(inner)
     if inner in (list, tuple):
         return JSON_ARRAY
 
@@ -259,6 +330,8 @@ def codec_for_annotation(annotation: Any) -> Codec:
             element, _ = unwrap_optional(args[0])
             if element is str:
                 return TEXT_LINES
+            if is_pydantic_model(element):
+                return model_lines_codec(element)
             if element is dict or get_origin(element) in _MAPPING_ORIGINS:
                 return JSON_LINES
         return JSON_ARRAY
