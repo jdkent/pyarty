@@ -281,9 +281,50 @@ extension. `File[dict]` is JSON because you *said* it was.
 | `list[dict]` | `.jsonl` | one JSON object per line |
 | `list` (other) | `.json` | indented JSON array |
 | `Path` | (source's) | copied from the given path |
+| a pydantic model `M` | `.json` | `M` as indented JSON |
+| `list[M]` | `.jsonl` | one `M` per line |
 
 An extension written into the pattern always wins: `at("payload.cfg")` on a
 `File[dict]` is still parsed as JSON.
+
+### Pydantic models
+
+Declare a pydantic (v2) model as the payload and the file is validated in both
+directions. A write takes only an instance of the model, and a read parses the
+file into it, so a file that breaks the contract fails where it is read rather
+than travelling on as a dict:
+
+```python
+from pydantic import BaseModel
+
+class Point(BaseModel):
+    x: float
+    y: float
+    z: float
+
+class Analysis(BaseModel):
+    key: str
+    points: list[Point] = []
+
+@bundle
+class Paper:
+    pmid: str
+    parse: File[Analysis] = at("{pmid}/parse.json")
+    points: File[list[Point]] = at("{pmid}/points.jsonl")
+    tables: Files[dict[str, Analysis]] = at(
+        "{pmid}/tables/{table}.json", key="table")
+```
+
+```python
+Paper.read("./out").parse          # an Analysis, not a dict
+# a parse.json whose point has only x:
+# ReadError: Field 'Paper.parse' declared File[Analysis] could not decode
+# '.../parse.json' as pydantic:Analysis: 2 validation errors for Analysis ...
+```
+
+Fields are written by alias, so models with aliased fields read back what they
+wrote. pydantic stays optional: pyarty never imports it, and only recognises a
+model class once your code has imported pydantic to define one.
 
 ## Strict write, lenient read
 
@@ -415,7 +456,7 @@ Absent on read → `None`. Absent on write → not written.
 pip install pyarty
 ```
 
-Python 3.11+, no dependencies.
+Python 3.11+, no dependencies. `pip install pyarty[pydantic]` adds pydantic for model payloads.
 
 ## Errors
 
