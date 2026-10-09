@@ -24,13 +24,6 @@ a pydantic model ``M``       ``.json``  ``M`` as indented JSON
 
 An explicit extension in the pattern always wins over the default above; only
 the encode/decode behaviour comes from the annotation.
-
-Pydantic models are validated in both directions: a write refuses anything that
-is not an instance of the declared model, and a read parses the file with
-``model_validate_json``, so a file that breaks the model is a ``ReadError``
-rather than a dict that only fails later. pydantic is not a dependency: a model
-class can only be declared once pydantic is imported, so the check looks for it
-in ``sys.modules`` instead of importing it.
 """
 
 from __future__ import annotations
